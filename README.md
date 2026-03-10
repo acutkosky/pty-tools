@@ -12,33 +12,35 @@ uv sync
 
 ```bash
 # Start a shell session
-pty_spawn myshell sh
+pty spawn myshell sh
 
 # Send a command and get output
-pty_interact myshell --input "echo hello\n" --stable_timeout 500
+pty interact myshell --input "echo hello\n" --stable_timeout 500
 # {"status": "ok", "exited": false, "response": "$ echo hello\r\nhello\r\n$ ", "mode": "raw"}
 
 # List active sessions
-pty_list
+pty list
 
 # Clean up
-pty_exit myshell
+pty exit myshell
 ```
 
 ## Commands
 
-### pty_spawn
+All commands are subcommands of `pty`. All responses are JSON.
+
+### pty spawn
 
 ```
-pty_spawn <id> <command> [--rows 24] [--cols 80]
+pty spawn <id> <cmd> [--rows 24] [--cols 80]
 ```
 
-Spawn a process in a new PTY session. The server runs as a daemon — the command returns immediately once the session is ready.
+Spawn a process in a new PTY session. The server runs as a detached subprocess — the command returns immediately once the session is ready.
 
-### pty_write
+### pty write
 
 ```
-pty_write <id> [id...] [--input TEXT] [--stream]
+pty write <id> [id...] [--input TEXT] [--stream]
 ```
 
 Send input to one or more sessions. Three modes:
@@ -46,10 +48,10 @@ Send input to one or more sessions. Three modes:
 - `--stream` — send stdin line by line (each line is delivered atomically)
 - *(default)* — read all of stdin, send as one chunk
 
-### pty_read
+### pty read
 
 ```
-pty_read <id> [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi]
+pty read <id> [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi]
 ```
 
 Read output since the last read. Returns JSON:
@@ -70,36 +72,38 @@ ANSI escape sequences are stripped by default. Use `--no_strip_ansi` to preserve
 
 The `mode` field is `"raw"` for normal output or `"screen"` when a TUI program (vim, htop, etc.) is using the alternate screen buffer, in which case the response is a pyte-rendered snapshot of the screen contents.
 
-### pty_interact
+### pty interact
 
 ```
-pty_interact <id> --input TEXT [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi]
+pty interact <id> --input TEXT [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi]
 ```
 
 Atomic write-then-read. Sends `TEXT` and reads the response in a single operation, avoiding race conditions between separate write and read calls.
 
-### pty_list
+### pty list
 
 ```
-pty_list
+pty list
 ```
 
 List active sessions as a JSON array. Stale entries (dead server processes) are cleaned up automatically.
 
-### pty_exit
+### pty exit
 
 ```
-pty_exit <id>
+pty exit <id>
 ```
 
 Terminate a session. If the server is unresponsive, force-kills the process and cleans up the socket and registry.
 
 ## Architecture
 
-Each `pty_spawn` forks a daemon that:
+`pty spawn` launches a detached subprocess that:
 1. Spawns the child process via `pexpect` in a PTY
 2. Listens on a Unix domain socket at `/tmp/pty_sessions/session_<id>.sock`
 3. Handles JSON messages from clients (write, read, interact, exit)
+
+Sessions survive the parent process exiting (including SSH logout) since the server runs in its own session via `start_new_session`.
 
 Reads are serialized (one at a time) and run `pexpect.expect()` in a thread executor so the async server stays responsive to other clients.
 
