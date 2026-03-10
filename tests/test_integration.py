@@ -7,10 +7,11 @@ import time
 
 import pytest
 
-from pty_tools.client import PTYClientError, send_request
 from pty_tools.common import (
+    PTYClientError,
     is_server_alive,
     read_registry,
+    send_request,
     socket_path_for,
     unregister_session,
 )

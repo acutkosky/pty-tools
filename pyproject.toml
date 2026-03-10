@@ -15,12 +15,7 @@ dev = [
 ]
 
 [project.scripts]
-pty_spawn = "pty_tools.cli.pty_spawn:main"
-pty_write = "pty_tools.cli.pty_write:main"
-pty_read = "pty_tools.cli.pty_read:main"
-pty_interact = "pty_tools.cli.pty_interact:main"
-pty_list = "pty_tools.cli.pty_list:main"
-pty_exit = "pty_tools.cli.pty_exit:main"
+pty = "pty_tools.cli:main"
 
 [build-system]
 requires = ["hatchling"]

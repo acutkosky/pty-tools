@@ -1,9 +1,13 @@
 """Async PTY server — one process per session, communicates via Unix domain socket."""
 
+import argparse
 import asyncio
 import json
 import os
 import signal
+import subprocess
+import sys
+import tempfile
 import time
 
 import pexpect
@@ -212,59 +216,79 @@ def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80):
 
 
 def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 80) -> dict:
-    """Fork a daemon process to run the PTY server. Returns status dict."""
-    import tempfile
-
+    """Launch a detached subprocess to run the PTY server. Returns status dict."""
     from pty_tools.common import ensure_socket_dir
 
     ensure_socket_dir()
     sock_path = socket_path_for(session_id)
 
-    # Temp file for the child to report startup errors back to the parent
+    # Stderr goes to a temp file so we can capture startup errors without
+    # leaving a pipe open (a broken pipe would SIGPIPE the long-lived server).
     err_fd, err_path = tempfile.mkstemp(prefix="pty_err_")
-    os.close(err_fd)
+    err_file = os.fdopen(err_fd, "w")
 
-    pid = os.fork()
-    if pid == 0:
-        os.setsid()
-        devnull = os.open(os.devnull, os.O_RDWR)
-        os.dup2(devnull, 0)
-        os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
-        os.close(devnull)
-        try:
-            run_server(session_id, command, rows=rows, cols=cols)
-        except Exception as e:
-            with open(err_path, "w") as f:
-                f.write(str(e))
-        os._exit(0)
-    else:
-        for _ in range(20):
-            if sock_path.exists():
-                os.unlink(err_path)
-                return {
-                    "status": "ok",
-                    "session_id": session_id,
-                    "command": command,
-                    "pid": pid,
-                    "socket_path": str(sock_path),
-                }
-            time.sleep(0.1)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pty_tools.server", session_id, command,
+         "--rows", str(rows), "--cols", str(cols)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=err_file,
+        start_new_session=True,
+    )
+    err_file.close()
 
-        # Socket never appeared — check if the child wrote an error
-        error_detail = ""
+    def _read_and_cleanup_err():
         try:
             with open(err_path) as f:
-                error_detail = f.read().strip()
+                return f.read().strip()
         except Exception:
-            pass
+            return ""
         finally:
             try:
                 os.unlink(err_path)
             except Exception:
                 pass
 
-        msg = f"Server for session '{session_id}' did not start"
-        if error_detail:
-            msg += f": {error_detail}"
-        return {"status": "error", "error": msg}
+    for _ in range(20):
+        if sock_path.exists():
+            _read_and_cleanup_err()
+            return {
+                "status": "ok",
+                "session_id": session_id,
+                "command": command,
+                "pid": proc.pid,
+                "socket_path": str(sock_path),
+            }
+        if proc.poll() is not None:
+            stderr = _read_and_cleanup_err()
+            msg = f"Server for session '{session_id}' did not start"
+            if stderr:
+                msg += f": {stderr}"
+            return {"status": "error", "error": msg}
+        time.sleep(0.1)
+
+    # Timeout — kill the stalled process
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    stderr = _read_and_cleanup_err()
+    msg = f"Server for session '{session_id}' did not start"
+    if stderr:
+        msg += f": {stderr}"
+    return {"status": "error", "error": msg}
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("session_id")
+    parser.add_argument("command")
+    parser.add_argument("--rows", type=int, default=24)
+    parser.add_argument("--cols", type=int, default=80)
+    args = parser.parse_args()
+
+    try:
+        run_server(args.session_id, args.command, rows=args.rows, cols=args.cols)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
