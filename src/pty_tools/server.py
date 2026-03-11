@@ -8,9 +8,8 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
-
 import re
+import time
 
 import pexpect
 
@@ -223,18 +222,16 @@ class PTYServer:
             if match_end is not None:
                 # Pattern matched — show data up to match, keep the rest
                 show = bytes(self.read_buffer[:match_end])
-                after = bytes(self.read_buffer[match_end:])
-                output = self.screen_tracker.process_output(
-                    show, strip_ansi=strip_ansi, mode=mode,
-                )
-                self.read_buffer = bytearray(after)
+                self.read_buffer = bytearray(self.read_buffer[match_end:])
             else:
                 # No pattern match (timeout/EOF) — show everything
-                output = self.screen_tracker.process_output(
-                    bytes(self.read_buffer), strip_ansi=strip_ansi, mode=mode,
-                )
+                show = bytes(self.read_buffer)
                 if not peek:
                     self.read_buffer.clear()
+
+            output = self.screen_tracker.process_output(
+                show, strip_ansi=strip_ansi, mode=mode,
+            )
 
             result["response"] = output["text"]
             result["mode"] = output["mode"]

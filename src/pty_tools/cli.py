@@ -51,9 +51,10 @@ def _send_to_all(session_ids: list[str], text: str):
             sys.exit(1)
 
 
-def cmd_read(args):
+def _build_read_msg(args, msg_type):
+    """Build the message dict common to read and interact."""
     msg = {
-        "type": "read",
+        "type": msg_type,
         "total_timeout": args.total_timeout,
         "stable_timeout": args.stable_timeout,
         "strip_ansi": not args.no_strip_ansi,
@@ -62,40 +63,28 @@ def cmd_read(args):
     }
     if args.pattern:
         msg["pattern"] = args.pattern
+    return msg
 
-    timeout = (args.total_timeout / 1000.0) + 5.0
 
+def _send_read(session_id, msg):
+    """Send a read/interact message and print the result."""
+    timeout = (msg["total_timeout"] / 1000.0) + 5.0
     try:
-        result = send_request(args.id, msg, timeout=timeout)
+        result = send_request(session_id, msg, timeout=timeout)
         print(json.dumps(result))
     except PTYClientError as e:
         print(json.dumps({"status": "error", "error": str(e)}))
         sys.exit(1)
+
+
+def cmd_read(args):
+    _send_read(args.id, _build_read_msg(args, "read"))
 
 
 def cmd_interact(args):
-    text = args.input_text.encode("utf-8").decode("unicode_escape")
-
-    msg = {
-        "type": "interact",
-        "text": text,
-        "total_timeout": args.total_timeout,
-        "stable_timeout": args.stable_timeout,
-        "strip_ansi": not args.no_strip_ansi,
-        "peek": args.peek,
-        "mode": args.mode,
-    }
-    if args.pattern:
-        msg["pattern"] = args.pattern
-
-    timeout = (args.total_timeout / 1000.0) + 5.0
-
-    try:
-        result = send_request(args.id, msg, timeout=timeout)
-        print(json.dumps(result))
-    except PTYClientError as e:
-        print(json.dumps({"status": "error", "error": str(e)}))
-        sys.exit(1)
+    msg = _build_read_msg(args, "interact")
+    msg["text"] = args.input_text.encode("utf-8").decode("unicode_escape")
+    _send_read(args.id, msg)
 
 
 def cmd_list(args):
