@@ -56,12 +56,24 @@ pty read <id> [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [-
 
 Read output since the last read. Returns JSON:
 ```json
-{"status": "ok", "exited": false, "response": "...", "mode": "raw"}
+{
+  "status": "ok",
+  "exited": false,
+  "response": "...",
+  "mode": "raw"
+}
 ```
 
 When the child process exits, includes exit status:
 ```json
-{"status": "ok", "exited": true, "exit_code": 0, "signal": null, "response": "...", "mode": "raw"}
+{
+  "status": "ok",
+  "exited": true,
+  "exit_code": 0,
+  "signal": null,
+  "response": "...",
+  "mode": "raw"
+}
 ```
 
 All responses include `"status"`: `"ok"` on success, `"error"` on failure.
