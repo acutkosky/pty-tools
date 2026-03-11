@@ -265,3 +265,296 @@ class TestFullLifecycle:
         assert "exited" in read_result
         assert "response" in read_result
         assert "mode" in read_result
+
+
+class TestPeek:
+    def setup_method(self):
+        self.session_id = f"test_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def _spawn(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+        # Drain initial output
+        time.sleep(0.3)
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+    def test_peek_preserves_output_for_subsequent_reads(self):
+        """Peek reads should preserve output so subsequent reads also see it."""
+        self._spawn()
+
+        # Interact with peek=True
+        peek1 = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo peek_test_123\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+                "peek": True,
+            },
+            timeout=10.0,
+        )
+        assert peek1["status"] == "ok"
+        assert "peek_test_123" in peek1["response"]
+
+        # Peek again: should still see the same output
+        peek2 = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 500, "peek": True},
+            timeout=10.0,
+        )
+        assert peek2["status"] == "ok"
+        assert "peek_test_123" in peek2["response"]
+
+        # Normal read: should also see it
+        normal = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert normal["status"] == "ok"
+        assert "peek_test_123" in normal["response"]
+
+    def test_peek_accumulates_across_writes(self):
+        """Multiple peek reads should accumulate output from successive writes."""
+        self._spawn()
+
+        peek1 = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo line1_aaa\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+                "peek": True,
+            },
+            timeout=10.0,
+        )
+        assert peek1["status"] == "ok"
+        assert "line1_aaa" in peek1["response"]
+
+        peek2 = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo line2_bbb\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+                "peek": True,
+            },
+            timeout=10.0,
+        )
+        assert peek2["status"] == "ok"
+        assert "line1_aaa" in peek2["response"]
+        assert "line2_bbb" in peek2["response"]
+
+    def test_pattern_match_in_peek_buffer(self):
+        self._spawn()
+
+        send_request(self.session_id, {"type": "write", "text": "echo MARKER\n"})
+        time.sleep(0.3)
+
+        # Peek (no pattern) — buffer the output
+        peek = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 500, "peek": True},
+            timeout=10.0,
+        )
+        assert "MARKER" in peek["response"]
+
+        # Normal read with pattern — should match immediately from buffered data
+        start = time.time()
+        result = send_request(
+            self.session_id,
+            {
+                "type": "read",
+                "total_timeout": 5000,
+                "stable_timeout": 500,
+                "pattern": "MARKER",
+            },
+            timeout=10.0,
+        )
+        elapsed = time.time() - start
+        assert result["status"] == "ok"
+        assert "MARKER" in result["response"]
+        # Should match near-instantly, not wait for total_timeout
+        assert elapsed < 3.0
+
+    def test_pattern_match_spans_peek_and_new_data(self):
+        self._spawn()
+
+        send_request(self.session_id, {"type": "write", "text": "printf MAR"})
+        time.sleep(0.3)
+
+        # Peek — buffers "MAR"
+        peek = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 500, "peek": True},
+            timeout=10.0,
+        )
+        assert "MAR" in peek["response"]
+
+        # Now send the rest
+        send_request(self.session_id, {"type": "write", "text": "KER\n"})
+
+        # Read with pattern that spans peek buffer + new data
+        result = send_request(
+            self.session_id,
+            {
+                "type": "read",
+                "total_timeout": 5000,
+                "stable_timeout": 500,
+                "pattern": "MARKER",
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "MARKER" in result["response"]
+
+    def test_peek_preserves_content_through_clear(self):
+        """Peek buffers raw bytes, so content survives a screen clear."""
+        self._spawn()
+
+        # Write and peek — buffers "visible_text" in raw bytes
+        peek = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo visible_text_999\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+                "peek": True,
+            },
+            timeout=10.0,
+        )
+        assert "visible_text_999" in peek["response"]
+
+        # Send a clear command — adds clear escape sequences to the stream
+        # Normal read with peek_buffer still holding old content
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "clear\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        # In raw mode, the peek buffer still has the old bytes — "visible_text"
+        # persists even though a clear was sent, because the raw bytes are accumulated
+        assert "visible_text_999" in result["response"]
+
+    def test_no_peek_clear_loses_content(self):
+        """Without peek, a clear causes old content to disappear from response."""
+        self._spawn()
+
+        # Normal read (no peek) — consumes and clears buffer
+        send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo gone_text_888\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        # Send clear and read — old content should NOT be in response
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "clear\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "gone_text_888" not in result["response"]
+
+    def test_read_consumes_in_raw_mode(self):
+        """A normal read consumes output so the next read only shows new data."""
+        self._spawn()
+
+        # Write and read (consume)
+        send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo consumed_aaa\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        # Write new data and read — should NOT contain the old consumed output
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo fresh_bbb\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "fresh_bbb" in result["response"]
+        assert "consumed_aaa" not in result["response"]
+
+    def test_screen_mode_peek_and_read_identical(self):
+        """In screen mode (alternate screen), peek and read show the same
+        screen state because pyte renders the live screen regardless of
+        the peek buffer."""
+        self._spawn()
+
+        # Use python to enter alternate screen, write text, and exit
+        # First peek-read to capture the screen state
+        send_request(
+            self.session_id,
+            {
+                "type": "write",
+                "text": (
+                    "python3 -c \""
+                    "import sys;"
+                    "sys.stdout.write('\\x1b[?1049h');"  # enter alt screen
+                    "sys.stdout.write('\\x1b[2J\\x1b[H');"  # clear + home
+                    "sys.stdout.write('SCREEN_CONTENT_XYZ\\n');"
+                    "sys.stdout.flush();"
+                    "import time; time.sleep(2);"
+                    "sys.stdout.write('\\x1b[?1049l');"  # leave alt screen
+                    "\"\n"
+                ),
+            },
+        )
+        time.sleep(0.5)
+
+        # Peek while in alternate screen
+        peek = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300, "peek": True},
+            timeout=5.0,
+        )
+        assert peek["mode"] == "screen"
+        assert "SCREEN_CONTENT_XYZ" in peek["response"]
+
+        # Normal read while still in alternate screen — should show same content
+        normal = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+        assert normal["mode"] == "screen"
+        assert "SCREEN_CONTENT_XYZ" in normal["response"]

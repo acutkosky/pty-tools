@@ -10,6 +10,8 @@ import sys
 import tempfile
 import time
 
+import re
+
 import pexpect
 
 from pty_tools.common import (
@@ -20,22 +22,50 @@ from pty_tools.common import (
 from pty_tools.screen import ScreenTracker
 
 
-def get_response(program, total_timeout, stable_timeout, pattern, screen_tracker):
-    """Read from pexpect child using expect(). Closely follows the design doc."""
+def get_response(program, total_timeout, stable_timeout, pattern, screen_tracker,
+                  buffered=b""):
+    """Read from pexpect child using read_nonblocking + re.search.
+
+    We avoid pexpect's built-in expect()/pattern matching for two reasons:
+
+    1. pexpect's internal _before buffer accumulates across expect() calls
+       and is only reset when a pattern *matches*. When no pattern matches
+       (timeout), _before grows forever and every subsequent read returns
+       the entire history of program output. This breaks read-consumption
+       semantics — a read should only return new data since the last read.
+
+    2. pexpect.expect() only searches data it reads itself. It has no way
+       to include our read buffer (previously-read-but-unconsumed bytes)
+       in its search, so patterns that span the buffer boundary or exist
+       entirely within it would be missed.
+
+    Instead, we use read_nonblocking() to pull raw bytes from the PTY and
+    re.search() on the combined buffered + new data ourselves.
+
+    Returns a dict with _raw (new bytes only), _match_end (position in
+    buffered+_raw where the pattern match ends, or None), and the
+    usual status/exited fields.
+    """
     start = time.monotonic()
     got_output = False
-    buffer = []
+    new_chunks = []
     ms = 1.0 / 1000
     exited = False
+    matched = False
+    match_end = None
     total_timeout_sec = total_timeout * ms
     stable_timeout_sec = stable_timeout * ms
 
-    # When no pattern is given, use "(?!)" as the expect pattern.
-    # This pattern cannot match anything, so pexpect will never find a match
-    # and we'll be forced to hit the TIMEOUT or EOF exceptions.
-    expect_pattern = pattern if pattern is not None else "(?!)"
+    combined = bytes(buffered)
 
-    while True:
+    # Check if pattern already matches in the buffered data
+    if pattern:
+        m = re.search(pattern, combined.decode("utf-8", errors="replace"))
+        if m:
+            matched = True
+            match_end = m.end()
+
+    while not matched:
         elapsed = time.monotonic() - start
         time_left = total_timeout_sec - elapsed
         if time_left < 0:
@@ -46,21 +76,25 @@ def get_response(program, total_timeout, stable_timeout, pattern, screen_tracker
         else:
             timeout = min(stable_timeout_sec, time_left) if stable_timeout >= 0 else time_left
 
-        matched = False
         try:
-            program.expect(expect_pattern, timeout=timeout)
-            raw = program.before + program.after
-            matched = True
+            raw = program.read_nonblocking(size=4096, timeout=timeout)
         except pexpect.TIMEOUT:
-            raw = program.before
+            raw = b""
         except pexpect.EOF:
-            raw = program.before
+            raw = b""
             exited = True
 
         screen_tracker.update_state(raw)
         if raw:
-            buffer.append(raw)
+            new_chunks.append(raw)
             got_output = True
+            combined = combined + raw
+
+        if pattern:
+            m = re.search(pattern, combined.decode("utf-8", errors="replace"))
+            if m:
+                matched = True
+                match_end = m.end()
 
         if matched or exited:
             break
@@ -78,11 +112,12 @@ def get_response(program, total_timeout, stable_timeout, pattern, screen_tracker
         except Exception:
             pass
 
-    collected = b"".join(buffer)
+    collected = b"".join(new_chunks)
     response = {
         "status": "ok",
         "exited": exited,
         "_raw": collected,
+        "_match_end": match_end,
     }
     if exited:
         response["exit_code"] = exit_code
@@ -104,7 +139,7 @@ class PTYServer:
         self.exited = False
         self.screen_tracker = ScreenTracker(rows=rows, cols=cols)
         self.read_lock = asyncio.Lock()
-        self.peek_buffer = bytearray()
+        self.read_buffer = bytearray()
         self._server: asyncio.Server | None = None
 
     async def start(self):
@@ -178,17 +213,30 @@ class PTYServer:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None, get_response, self.child, total_timeout, stable_timeout,
-                pattern, self.screen_tracker,
+                pattern, self.screen_tracker, bytes(self.read_buffer),
             )
             new_raw = result.pop("_raw", b"")
-            self.peek_buffer.extend(new_raw)
-            output = self.screen_tracker.process_output(
-                bytes(self.peek_buffer), strip_ansi=strip_ansi,
-            )
+            match_end = result.pop("_match_end", None)
+            self.read_buffer.extend(new_raw)
+
+            if match_end is not None:
+                # Pattern matched — show data up to match, keep the rest
+                show = bytes(self.read_buffer[:match_end])
+                after = bytes(self.read_buffer[match_end:])
+                output = self.screen_tracker.process_output(
+                    show, strip_ansi=strip_ansi,
+                )
+                self.read_buffer = bytearray(after)
+            else:
+                # No pattern match (timeout/EOF) — show everything
+                output = self.screen_tracker.process_output(
+                    bytes(self.read_buffer), strip_ansi=strip_ansi,
+                )
+                if not peek:
+                    self.read_buffer.clear()
+
             result["response"] = output["text"]
             result["mode"] = output["mode"]
-            if not peek:
-                self.peek_buffer.clear()
         self.exited = result["exited"]
         return result
 
