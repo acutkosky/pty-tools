@@ -57,6 +57,7 @@ def cmd_read(args):
         "total_timeout": args.total_timeout,
         "stable_timeout": args.stable_timeout,
         "strip_ansi": not args.no_strip_ansi,
+        "peek": args.peek,
     }
     if args.pattern:
         msg["pattern"] = args.pattern
@@ -80,6 +81,7 @@ def cmd_interact(args):
         "total_timeout": args.total_timeout,
         "stable_timeout": args.stable_timeout,
         "strip_ansi": not args.no_strip_ansi,
+        "peek": args.peek,
     }
     if args.pattern:
         msg["pattern"] = args.pattern
@@ -135,6 +137,7 @@ def _add_read_args(parser):
     parser.add_argument("--stable_timeout", type=int, default=500, help="Stable timeout in ms (default: 500)")
     parser.add_argument("--pattern", help="Regex pattern to wait for")
     parser.add_argument("--no_strip_ansi", action="store_true", help="Preserve ANSI escape sequences")
+    parser.add_argument("--peek", action="store_true", help="Read without consuming output")
 
 
 def main(argv=None):

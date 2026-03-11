@@ -51,7 +51,7 @@ Send input to one or more sessions. Three modes:
 ### pty read
 
 ```
-pty read <id> [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi]
+pty read <id> [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi] [--peek]
 ```
 
 Read output since the last read. Returns JSON:
@@ -68,6 +68,8 @@ All responses include `"status"`: `"ok"` on success, `"error"` on failure.
 
 **Timeout behavior:** Wait up to `total_timeout` ms for the first byte. Once output starts, return after `stable_timeout` ms of silence (or when `total_timeout` expires, whichever comes first). If `--pattern` is given, return as soon as the output matches the regex.
 
+By default, a read **consumes** the output — subsequent reads only see new data. Use `--peek` to read without consuming: the output is buffered and included in the next read. A normal read (without `--peek`) clears the buffer. This is useful for monitoring a session without interfering with a primary reader.
+
 ANSI escape sequences are stripped by default. Use `--no_strip_ansi` to preserve them.
 
 The `mode` field is `"raw"` for normal output or `"screen"` when a TUI program (vim, htop, etc.) is using the alternate screen buffer, in which case the response is a pyte-rendered snapshot of the screen contents.
@@ -75,7 +77,7 @@ The `mode` field is `"raw"` for normal output or `"screen"` when a TUI program (
 ### pty interact
 
 ```
-pty interact <id> --input TEXT [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi]
+pty interact <id> --input TEXT [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi] [--peek]
 ```
 
 Atomic write-then-read. Sends `TEXT` and reads the response in a single operation, avoiding race conditions between separate write and read calls.

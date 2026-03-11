@@ -20,7 +20,7 @@ from pty_tools.common import (
 from pty_tools.screen import ScreenTracker
 
 
-def get_response(program, total_timeout, stable_timeout, pattern, screen_tracker, strip_ansi):
+def get_response(program, total_timeout, stable_timeout, pattern, screen_tracker):
     """Read from pexpect child using expect(). Closely follows the design doc."""
     start = time.monotonic()
     got_output = False
@@ -79,12 +79,10 @@ def get_response(program, total_timeout, stable_timeout, pattern, screen_tracker
             pass
 
     collected = b"".join(buffer)
-    result = screen_tracker.process_output(collected, strip_ansi=strip_ansi)
     response = {
         "status": "ok",
         "exited": exited,
-        "response": result["text"],
-        "mode": result["mode"],
+        "_raw": collected,
     }
     if exited:
         response["exit_code"] = exit_code
@@ -106,6 +104,7 @@ class PTYServer:
         self.exited = False
         self.screen_tracker = ScreenTracker(rows=rows, cols=cols)
         self.read_lock = asyncio.Lock()
+        self.peek_buffer = bytearray()
         self._server: asyncio.Server | None = None
 
     async def start(self):
@@ -173,13 +172,23 @@ class PTYServer:
         stable_timeout = msg.get("stable_timeout", 500)
         pattern = msg.get("pattern")
         strip_ansi = msg.get("strip_ansi", True)
+        peek = msg.get("peek", False)
 
         async with self.read_lock:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None, get_response, self.child, total_timeout, stable_timeout,
-                pattern, self.screen_tracker, strip_ansi,
+                pattern, self.screen_tracker,
             )
+            new_raw = result.pop("_raw", b"")
+            self.peek_buffer.extend(new_raw)
+            output = self.screen_tracker.process_output(
+                bytes(self.peek_buffer), strip_ansi=strip_ansi,
+            )
+            result["response"] = output["text"]
+            result["mode"] = output["mode"]
+            if not peek:
+                self.peek_buffer.clear()
         self.exited = result["exited"]
         return result
 
