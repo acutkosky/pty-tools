@@ -267,6 +267,80 @@ class TestFullLifecycle:
         assert "mode" in read_result
 
 
+class TestMode:
+    def setup_method(self):
+        self.session_id = f"test_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def _spawn(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+        # Drain initial output
+        time.sleep(0.3)
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+    def test_mode_screen_on_non_tui(self):
+        """Forcing mode='screen' on a plain shell should return pyte-rendered output."""
+        self._spawn()
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo screen_mode_test\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+                "mode": "screen",
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert result["mode"] == "screen"
+        assert "screen_mode_test" in result["response"]
+
+    def test_mode_raw_always_returns_raw(self):
+        """Forcing mode='raw' should always return raw decoded bytes."""
+        self._spawn()
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo raw_mode_test\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+                "mode": "raw",
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert result["mode"] == "raw"
+        assert "raw_mode_test" in result["response"]
+
+    def test_mode_auto_default(self):
+        """Default mode='auto' should behave as before (raw for non-TUI)."""
+        self._spawn()
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo auto_test\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert result["mode"] == "raw"
+
+
 class TestPeek:
     def setup_method(self):
         self.session_id = f"test_{os.getpid()}_{int(time.time() * 1000)}"

@@ -36,18 +36,31 @@ class ScreenTracker:
         elif leave_pos >= 0 and leave_pos > enter_pos:
             self.in_alternate_screen = False
 
-        # If in alternate screen, feed bytes to pyte for incremental updates
-        if self.in_alternate_screen:
+        # Always feed bytes to pyte so it has complete state if screen mode
+        # is later requested (e.g. via mode="screen" override)
+        if raw_bytes:
             self._pyte_stream.feed(raw_bytes)
 
-    def process_output(self, raw_bytes: bytes, strip_ansi: bool = True) -> dict:
+    def process_output(self, raw_bytes: bytes, strip_ansi: bool = True,
+                        mode: str = "auto") -> dict:
         """Process raw output and return rendered text with mode indicator.
+
+        Args:
+            raw_bytes: Raw bytes to process (used for "raw" rendering).
+            strip_ansi: Whether to strip ANSI escape sequences in raw mode.
+            mode: "auto" (default) uses alternate screen detection,
+                  "raw" forces raw decoded output,
+                  "screen" forces pyte-rendered output.
 
         Returns dict with keys:
             - text: the processed output string
             - mode: "screen" if rendered via pyte, "raw" otherwise
         """
-        if self.in_alternate_screen:
+        use_screen = (
+            self.in_alternate_screen if mode == "auto" else mode == "screen"
+        )
+
+        if use_screen:
             lines = self._pyte_screen.display
             while lines and not lines[-1].strip():
                 lines = lines[:-1]

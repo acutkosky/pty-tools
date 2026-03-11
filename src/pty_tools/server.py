@@ -208,6 +208,7 @@ class PTYServer:
         pattern = msg.get("pattern")
         strip_ansi = msg.get("strip_ansi", True)
         peek = msg.get("peek", False)
+        mode = msg.get("mode", "auto")
 
         async with self.read_lock:
             loop = asyncio.get_running_loop()
@@ -224,13 +225,13 @@ class PTYServer:
                 show = bytes(self.read_buffer[:match_end])
                 after = bytes(self.read_buffer[match_end:])
                 output = self.screen_tracker.process_output(
-                    show, strip_ansi=strip_ansi,
+                    show, strip_ansi=strip_ansi, mode=mode,
                 )
                 self.read_buffer = bytearray(after)
             else:
                 # No pattern match (timeout/EOF) — show everything
                 output = self.screen_tracker.process_output(
-                    bytes(self.read_buffer), strip_ansi=strip_ansi,
+                    bytes(self.read_buffer), strip_ansi=strip_ansi, mode=mode,
                 )
                 if not peek:
                     self.read_buffer.clear()

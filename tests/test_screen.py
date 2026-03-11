@@ -88,6 +88,35 @@ class TestScreenTracker:
         lines = result["text"].split("\n")
         assert len(lines) < 10
 
+    def test_mode_raw_overrides_alternate_screen(self):
+        """mode='raw' should return raw bytes even when in alternate screen."""
+        tracker = ScreenTracker(rows=5, cols=20)
+        tracker.update_state(ENTER_ALT_SCREEN + b"\x1b[1;1HScreen Text")
+        assert tracker.in_alternate_screen
+        result = tracker.process_output(b"raw bytes here", mode="raw")
+        assert result["mode"] == "raw"
+        assert result["text"] == "raw bytes here"
+
+    def test_mode_screen_without_alternate_screen(self):
+        """mode='screen' should return pyte-rendered output even outside alternate screen."""
+        tracker = ScreenTracker(rows=5, cols=20)
+        tracker.update_state(b"Hello World")
+        assert not tracker.in_alternate_screen
+        result = tracker.process_output(b"ignored raw", mode="screen")
+        assert result["mode"] == "screen"
+        assert "Hello World" in result["text"]
+
+    def test_mode_auto_uses_alternate_screen_flag(self):
+        """mode='auto' should behave like the default (use in_alternate_screen)."""
+        tracker = ScreenTracker(rows=5, cols=20)
+        result = tracker.process_output(b"plain text", mode="auto")
+        assert result["mode"] == "raw"
+        assert result["text"] == "plain text"
+
+        tracker.update_state(ENTER_ALT_SCREEN + b"\x1b[1;1HScreen")
+        result = tracker.process_output(b"", mode="auto")
+        assert result["mode"] == "screen"
+
     def test_pyte_reset_on_reenter(self):
         tracker = ScreenTracker(rows=5, cols=20)
         tracker.update_state(ENTER_ALT_SCREEN + b"\x1b[1;1HOld Content")
