@@ -1,6 +1,6 @@
 # pty_tools
 
-Command-line tools for spawning processes in PTYs and interacting with them programmatically. Each session runs in a daemonized server process, communicating over a Unix domain socket. Useful standalone and as building blocks for LLM agents that need terminal access.
+Command-line tools for spawning processes in PTYs and interacting with them programmatically. Each session runs in a server process, communicating over a Unix domain socket. Useful standalone and as building blocks for LLM agents that need terminal access.
 
 ## Install
 
@@ -11,8 +11,11 @@ uv sync
 ## Quick start
 
 ```bash
-# Start a shell session
+# Start a shell session (runs in foreground, PTY output streams to stdout)
 pty spawn myshell sh
+
+# Or detach it to run in the background
+pty spawn --detach myshell sh
 
 # Send a command and get output
 pty interact myshell --input "echo hello\n" --stable_timeout 500
@@ -32,10 +35,27 @@ All commands are subcommands of `pty`. All responses are JSON.
 ### pty spawn
 
 ```
-pty spawn <id> <cmd> [--rows 24] [--cols 80]
+pty spawn <id> <cmd> [--rows 24] [--cols 80] [--detach]
 ```
 
-Spawn a process in a new PTY session. The server runs as a detached subprocess — the command returns immediately once the session is ready.
+Spawn a process in a new PTY session.
+
+By default, the server runs in the **foreground**: stdin is forwarded to the PTY line-by-line, and raw PTY output is streamed to stdout. The session is also accessible via socket commands (`pty read`, `pty write`, etc.) from other processes. Status JSON is printed to stderr. The server exits when the child process exits, or on Ctrl+C.
+
+```bash
+# Foreground — interactive, stdout is a live tap of PTY output
+pty spawn myshell sh
+
+# Pipe input, capture output
+echo "ls -la" | pty spawn myshell sh > output.txt 2>/dev/null &
+```
+
+With `--detach`, the server runs as a detached background process — the command returns immediately once the session is ready. Detached sessions survive the parent process exiting (including SSH logout).
+
+```bash
+pty spawn --detach myshell sh
+# {"status": "ok", "session_id": "myshell", "command": "sh", "pid": 12345, ...}
+```
 
 ### pty write
 
@@ -115,14 +135,15 @@ Terminate a session. If the server is unresponsive, force-kills the process and 
 
 ## Architecture
 
-`pty spawn` launches a detached subprocess that:
+Each session is a server process that:
 1. Spawns the child process via `pexpect` in a PTY
-2. Listens on a Unix domain socket at `/tmp/pty_sessions/session_<id>.sock`
-3. Handles JSON messages from clients (write, read, interact, exit)
+2. Runs a background reader thread that continuously reads PTY output into a buffer
+3. Listens on a Unix domain socket at `/tmp/pty_sessions/session_<id>.sock`
+4. Handles JSON messages from clients (write, read, interact, exit)
 
-Spawned processes survive the parent process exiting (including SSH logout).
+In foreground mode, the reader thread also streams raw PTY output to stdout, and a separate thread forwards stdin to the PTY. In detached mode (`--detach`), stdin/stdout are disconnected and the process runs independently.
 
-Reads are serialized (one at a time) and run `pexpect.expect()` in a thread executor so the async server stays responsive to other clients.
+Reads are serialized (one at a time) via an async lock. The read waits on an event that the background reader signals whenever new data arrives, implementing the timeout and pattern-matching logic reactively.
 
 A shared registry at `/tmp/pty_sessions/registry.json` (protected by `flock`) tracks active sessions.
 

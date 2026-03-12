@@ -3,6 +3,9 @@
 import json
 import os
 import signal
+import subprocess
+import sys
+import threading
 import time
 
 import pytest
@@ -15,7 +18,7 @@ from pty_tools.common import (
     socket_path_for,
     unregister_session,
 )
-from pty_tools.server import daemonize_server
+from pty_tools.server import daemonize_server, run_server
 
 
 def _cleanup_session(session_id: str):
@@ -607,7 +610,7 @@ class TestPeek:
                     "sys.stdout.write('\\x1b[2J\\x1b[H');"  # clear + home
                     "sys.stdout.write('SCREEN_CONTENT_XYZ\\n');"
                     "sys.stdout.flush();"
-                    "import time; time.sleep(2);"
+                    "import time; time.sleep(5);"
                     "sys.stdout.write('\\x1b[?1049l');"  # leave alt screen
                     "\"\n"
                 ),
@@ -632,3 +635,180 @@ class TestPeek:
         )
         assert normal["mode"] == "screen"
         assert "SCREEN_CONTENT_XYZ" in normal["response"]
+
+
+class TestForeground:
+    """Tests for foreground (non-detached) spawn mode."""
+
+    def setup_method(self):
+        self.session_id = f"test_fg_{os.getpid()}_{int(time.time() * 1000)}"
+        self._proc = None
+
+    def teardown_method(self):
+        if self._proc and self._proc.poll() is None:
+            self._proc.kill()
+            self._proc.wait()
+        _cleanup_session(self.session_id)
+
+    def _spawn_foreground(self, command="sh", stdin_lines=None):
+        """Spawn a foreground server as a subprocess.
+
+        Returns (process, stdin_w_fd) where stdin_w_fd can be used to send
+        more input, or None if stdin_lines were provided and stdin was closed.
+        """
+        stdin_r, stdin_w = os.pipe()
+
+        self._proc = subprocess.Popen(
+            [sys.executable, "-m", "pty_tools.server",
+             self.session_id, command, "--foreground"],
+            stdin=stdin_r,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(stdin_r)
+
+        # Wait for socket to appear
+        sock_path = socket_path_for(self.session_id)
+        for _ in range(30):
+            if sock_path.exists():
+                break
+            time.sleep(0.1)
+        assert sock_path.exists(), "Server socket did not appear"
+
+        # Write stdin lines if provided
+        if stdin_lines:
+            for line in stdin_lines:
+                os.write(stdin_w, (line + "\n").encode())
+                time.sleep(0.1)
+            os.close(stdin_w)
+            return self._proc, None
+
+        return self._proc, stdin_w
+
+    def test_foreground_socket_works(self):
+        """Foreground server should accept socket commands like detached mode."""
+        proc, stdin_w = self._spawn_foreground()
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo fg_socket_test\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "fg_socket_test" in result["response"]
+        os.close(stdin_w)
+
+    def test_foreground_stdout_tap(self):
+        """Foreground server should write raw PTY output to stdout."""
+        proc, stdin_w = self._spawn_foreground()
+
+        # Send a command via socket and read to ensure output is produced
+        send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo tap_test_xyz\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        # Shut down so stdout closes
+        send_request(self.session_id, {"type": "exit"}, timeout=10.0)
+        os.close(stdin_w)
+        proc.wait(timeout=5.0)
+
+        stdout_data = proc.stdout.read().decode("utf-8", errors="replace")
+        assert "tap_test_xyz" in stdout_data
+
+    def test_foreground_stdin_forwarding(self):
+        """Foreground server should forward stdin lines to the PTY."""
+        proc, _ = self._spawn_foreground(stdin_lines=["echo stdin_fwd_test"])
+
+        # Give the command time to execute
+        time.sleep(0.5)
+
+        result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "stdin_fwd_test" in result["response"]
+
+    def test_foreground_child_exit_shuts_down(self):
+        """When the child exits in foreground mode, the server should shut down."""
+        proc, _ = self._spawn_foreground(
+            command="sh", stdin_lines=["exit 0"]
+        )
+
+        # The server should shut down after child exits
+        proc.wait(timeout=10.0)
+        assert proc.returncode is not None, "Server did not shut down after child exit"
+
+    def test_foreground_and_detach_produce_same_results(self):
+        """Socket interactions should produce identical results in both modes."""
+        # Foreground
+        proc, stdin_w = self._spawn_foreground()
+        fg_result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo parity_check\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        send_request(self.session_id, {"type": "exit"}, timeout=10.0)
+        os.close(stdin_w)
+        proc.wait(timeout=5.0)
+        _cleanup_session(self.session_id)
+
+        # Detached — use a new session id
+        detach_id = self.session_id + "_d"
+        try:
+            result = daemonize_server(detach_id, "sh")
+            assert result["status"] == "ok"
+            det_result = send_request(
+                detach_id,
+                {
+                    "type": "interact",
+                    "text": "echo parity_check\n",
+                    "total_timeout": 3000,
+                    "stable_timeout": 500,
+                },
+                timeout=10.0,
+            )
+            send_request(detach_id, {"type": "exit"}, timeout=10.0)
+        finally:
+            _cleanup_session(detach_id)
+
+        # Both should succeed with the same key fields
+        assert fg_result["status"] == det_result["status"] == "ok"
+        assert "parity_check" in fg_result["response"]
+        assert "parity_check" in det_result["response"]
+        assert fg_result["mode"] == det_result["mode"]
+
+    def test_cli_detach_flag(self):
+        """CLI --detach flag should daemonize like the old default behavior."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "spawn", "--detach",
+             self.session_id, "sh"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert proc.returncode == 0
+        result = json.loads(proc.stdout)
+        assert result["status"] == "ok"
+        assert result["session_id"] == self.session_id
+
+        # Verify it's actually running
+        assert is_server_alive(self.session_id)
+
+        send_request(self.session_id, {"type": "exit"}, timeout=10.0)

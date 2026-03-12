@@ -14,7 +14,7 @@ from pty_tools.common import (
     socket_path_for,
     unregister_session,
 )
-from pty_tools.server import daemonize_server
+from pty_tools.server import daemonize_server, run_server
 
 
 def cmd_spawn(args):
@@ -23,10 +23,20 @@ def cmd_spawn(args):
         print(json.dumps(result))
         sys.exit(1)
 
-    result = daemonize_server(args.id, args.cmd, rows=args.rows, cols=args.cols)
-    print(json.dumps(result))
-    if result["status"] != "ok":
-        sys.exit(1)
+    if args.detach:
+        result = daemonize_server(args.id, args.cmd, rows=args.rows, cols=args.cols)
+        print(json.dumps(result))
+        if result["status"] != "ok":
+            sys.exit(1)
+    else:
+        status = {
+            "status": "ok",
+            "session_id": args.id,
+            "command": args.cmd,
+            "pid": os.getpid(),
+        }
+        print(json.dumps(status), file=sys.stderr)
+        run_server(args.id, args.cmd, rows=args.rows, cols=args.cols, foreground=True)
 
 
 def cmd_write(args):
@@ -143,6 +153,8 @@ def main(argv=None):
     p.add_argument("cmd", help="Command to run in the PTY")
     p.add_argument("--rows", type=int, default=24, help="Terminal rows (default: 24)")
     p.add_argument("--cols", type=int, default=80, help="Terminal columns (default: 80)")
+    p.add_argument("--detach", action="store_true",
+                   help="Daemonize the server (default: run in foreground)")
     p.set_defaults(func=cmd_spawn)
 
     # write

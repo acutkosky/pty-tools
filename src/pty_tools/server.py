@@ -4,11 +4,12 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import tempfile
-import re
+import threading
 import time
 
 import pexpect
@@ -21,127 +22,31 @@ from pty_tools.common import (
 from pty_tools.screen import ScreenTracker
 
 
-def get_response(program, total_timeout, stable_timeout, pattern, screen_tracker,
-                  buffered=b""):
-    """Read from pexpect child using read_nonblocking + re.search.
-
-    We avoid pexpect's built-in expect()/pattern matching for two reasons:
-
-    1. pexpect's internal _before buffer accumulates across expect() calls
-       and is only reset when a pattern *matches*. When no pattern matches
-       (timeout), _before grows forever and every subsequent read returns
-       the entire history of program output. This breaks read-consumption
-       semantics — a read should only return new data since the last read.
-
-    2. pexpect.expect() only searches data it reads itself. It has no way
-       to include our read buffer (previously-read-but-unconsumed bytes)
-       in its search, so patterns that span the buffer boundary or exist
-       entirely within it would be missed.
-
-    Instead, we use read_nonblocking() to pull raw bytes from the PTY and
-    re.search() on the combined buffered + new data ourselves.
-
-    Returns a dict with _raw (new bytes only), _match_end (position in
-    buffered+_raw where the pattern match ends, or None), and the
-    usual status/exited fields.
-    """
-    start = time.monotonic()
-    got_output = False
-    new_chunks = []
-    ms = 1.0 / 1000
-    exited = False
-    matched = False
-    match_end = None
-    total_timeout_sec = total_timeout * ms
-    stable_timeout_sec = stable_timeout * ms
-
-    combined = bytes(buffered)
-
-    # Check if pattern already matches in the buffered data
-    if pattern:
-        m = re.search(pattern, combined.decode("utf-8", errors="replace"))
-        if m:
-            matched = True
-            match_end = m.end()
-
-    while not matched:
-        elapsed = time.monotonic() - start
-        time_left = total_timeout_sec - elapsed
-        if time_left < 0:
-            break
-
-        if not got_output:
-            timeout = time_left
-        else:
-            timeout = min(stable_timeout_sec, time_left) if stable_timeout >= 0 else time_left
-
-        try:
-            raw = program.read_nonblocking(size=4096, timeout=timeout)
-        except pexpect.TIMEOUT:
-            raw = b""
-        except pexpect.EOF:
-            raw = b""
-            exited = True
-
-        screen_tracker.update_state(raw)
-        if raw:
-            new_chunks.append(raw)
-            got_output = True
-            combined = combined + raw
-
-        if pattern:
-            m = re.search(pattern, combined.decode("utf-8", errors="replace"))
-            if m:
-                matched = True
-                match_end = m.end()
-
-        if matched or exited:
-            break
-        if got_output and not raw:
-            break  # output was stable for stable_timeout
-
-    # If the child exited, wait for it so we can get the exit code
-    exit_code = None
-    exit_signal = None
-    if exited:
-        try:
-            program.close()
-            exit_code = program.exitstatus
-            exit_signal = program.signalstatus
-        except Exception:
-            pass
-
-    collected = b"".join(new_chunks)
-    response = {
-        "status": "ok",
-        "exited": exited,
-        "_raw": collected,
-        "_match_end": match_end,
-    }
-    if exited:
-        response["exit_code"] = exit_code
-        response["signal"] = exit_signal
-    return response
-
-
 class PTYServer:
     """Manages a single PTY session with an async Unix socket interface."""
 
-    def __init__(self, session_id: str, command: str, rows: int = 24, cols: int = 80):
+    def __init__(self, session_id: str, command: str, rows: int = 24, cols: int = 80,
+                 foreground: bool = False):
         self.session_id = session_id
         self.command = command
         self.rows = rows
         self.cols = cols
         self.sock_path = str(socket_path_for(session_id))
+        self.foreground = foreground
 
         self.child: pexpect.spawn | None = None
         self.exited = False
+        self.exit_code = None
+        self.exit_signal = None
         self.screen_tracker = ScreenTracker(rows=rows, cols=cols)
         self.read_lock = asyncio.Lock()
         self.read_buffer = bytearray()
         self._server: asyncio.Server | None = None
+        self._new_data = asyncio.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self):
+        self._loop = asyncio.get_running_loop()
         self.child = pexpect.spawn(
             self.command, encoding=None, dimensions=(self.rows, self.cols),
         )
@@ -149,9 +54,70 @@ class PTYServer:
         self._server = await asyncio.start_unix_server(
             self._handle_client, path=self.sock_path
         )
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self._shutdown()))
+        # Signal handlers only work on the main thread
+        try:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                self._loop.add_signal_handler(sig, lambda: asyncio.create_task(self._shutdown()))
+        except RuntimeError:
+            pass
+
+        # Start background PTY reader thread
+        threading.Thread(target=self._read_loop, daemon=True).start()
+
+        # Start stdin forwarder if foreground
+        if self.foreground:
+            threading.Thread(target=self._stdin_loop, daemon=True).start()
+
+    def _read_loop(self):
+        """Background thread: continuously reads from PTY and dispatches to asyncio."""
+        while True:
+            try:
+                raw = self.child.read_nonblocking(size=4096, timeout=1.0)
+            except pexpect.TIMEOUT:
+                continue
+            except pexpect.EOF:
+                try:
+                    self.child.close()
+                    exit_code = self.child.exitstatus
+                    exit_signal = self.child.signalstatus
+                except Exception:
+                    exit_code = None
+                    exit_signal = None
+                self._loop.call_soon_threadsafe(self._on_eof, exit_code, exit_signal)
+                return
+            except Exception:
+                return
+
+            if raw:
+                self._loop.call_soon_threadsafe(self._on_data, raw)
+
+    def _stdin_loop(self):
+        """Background thread: reads stdin line-by-line, forwards to PTY."""
+        try:
+            for line in sys.stdin:
+                if self.exited:
+                    break
+                self.child.send(line.encode("utf-8"))
+        except (EOFError, OSError):
+            pass
+
+    def _on_data(self, raw: bytes):
+        """Called on asyncio thread when PTY produces output."""
+        self.screen_tracker.update_state(raw)
+        self.read_buffer.extend(raw)
+        if self.foreground:
+            sys.stdout.buffer.write(raw)
+            sys.stdout.buffer.flush()
+        self._new_data.set()
+
+    def _on_eof(self, exit_code, exit_signal):
+        """Called on asyncio thread when PTY child exits."""
+        self.exited = True
+        self.exit_code = exit_code
+        self.exit_signal = exit_signal
+        self._new_data.set()
+        if self.foreground:
+            asyncio.create_task(self._shutdown())
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a single client connection."""
@@ -202,29 +168,71 @@ class PTYServer:
         return {"status": "ok"}
 
     async def _do_read(self, msg: dict) -> dict:
-        total_timeout = msg.get("total_timeout", 5000)
-        stable_timeout = msg.get("stable_timeout", 500)
+        total_timeout = msg.get("total_timeout", 5000) / 1000.0
+        stable_timeout = msg.get("stable_timeout", 500) / 1000.0
         pattern = msg.get("pattern")
         strip_ansi = msg.get("strip_ansi", True)
         peek = msg.get("peek", False)
         mode = msg.get("mode", "auto")
 
         async with self.read_lock:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None, get_response, self.child, total_timeout, stable_timeout,
-                pattern, self.screen_tracker, bytes(self.read_buffer),
-            )
-            new_raw = result.pop("_raw", b"")
-            match_end = result.pop("_match_end", None)
-            self.read_buffer.extend(new_raw)
+            start = time.monotonic()
+            got_output = False
+            match_end = None
+            prev_buf_len = len(self.read_buffer)
 
+            while True:
+                # Check pattern match against entire unconsumed buffer
+                if pattern:
+                    text = bytes(self.read_buffer).decode("utf-8", errors="replace")
+                    m = re.search(pattern, text)
+                    if m:
+                        match_end = m.end()
+                        break
+
+                if self.exited:
+                    break
+
+                elapsed = time.monotonic() - start
+                remaining = total_timeout - elapsed
+                if remaining <= 0:
+                    break
+
+                if got_output and stable_timeout >= 0:
+                    wait_time = min(stable_timeout, remaining)
+                else:
+                    wait_time = remaining
+
+                # Wait for the background reader to deliver new data
+                self._new_data.clear()
+                try:
+                    await asyncio.wait_for(self._new_data.wait(), timeout=wait_time)
+                except asyncio.TimeoutError:
+                    pass
+
+                # If buffer grew, we got output — loop to re-check pattern/exit.
+                # If it didn't grow and we already had output, that's stable silence.
+                new_buf_len = len(self.read_buffer)
+                if new_buf_len > prev_buf_len:
+                    got_output = True
+                    prev_buf_len = new_buf_len
+                elif got_output:
+                    break
+
+            # Build result
+            result = {
+                "status": "ok",
+                "exited": self.exited,
+            }
+            if self.exited:
+                result["exit_code"] = self.exit_code
+                result["signal"] = self.exit_signal
+
+            # Consume buffer (pattern match consumes up to match; otherwise all)
             if match_end is not None:
-                # Pattern matched — show data up to match, keep the rest
                 show = bytes(self.read_buffer[:match_end])
                 self.read_buffer = bytearray(self.read_buffer[match_end:])
             else:
-                # No pattern match (timeout/EOF) — show everything
                 show = bytes(self.read_buffer)
                 if not peek:
                     self.read_buffer.clear()
@@ -232,10 +240,9 @@ class PTYServer:
             output = self.screen_tracker.process_output(
                 show, strip_ansi=strip_ansi, mode=mode,
             )
-
             result["response"] = output["text"]
             result["mode"] = output["mode"]
-        self.exited = result["exited"]
+
         return result
 
     async def _shutdown(self):
@@ -256,9 +263,10 @@ class PTYServer:
         asyncio.get_running_loop().stop()
 
 
-def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80):
-    """Entry point for the daemonized server process."""
-    server = PTYServer(session_id, command, rows=rows, cols=cols)
+def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
+               foreground: bool = False):
+    """Entry point for the server process."""
+    server = PTYServer(session_id, command, rows=rows, cols=cols, foreground=foreground)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(server.start())
@@ -340,10 +348,12 @@ if __name__ == "__main__":
     parser.add_argument("command")
     parser.add_argument("--rows", type=int, default=24)
     parser.add_argument("--cols", type=int, default=80)
+    parser.add_argument("--foreground", action="store_true")
     args = parser.parse_args()
 
     try:
-        run_server(args.session_id, args.command, rows=args.rows, cols=args.cols)
+        run_server(args.session_id, args.command, rows=args.rows, cols=args.cols,
+                   foreground=args.foreground)
     except Exception as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
