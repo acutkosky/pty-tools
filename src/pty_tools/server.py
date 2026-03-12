@@ -2,17 +2,21 @@
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
+import pty as pty_mod
 import re
+import select
+import shlex
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
-
-import pexpect
 
 from pty_tools.common import (
     register_session,
@@ -20,6 +24,14 @@ from pty_tools.common import (
     unregister_session,
 )
 from pty_tools.screen import ScreenTracker
+
+
+def _open_pty(rows: int, cols: int):
+    """Create a PTY pair and set the terminal size. Returns (master_fd, slave_fd)."""
+    master_fd, slave_fd = pty_mod.openpty()
+    winsize = struct.pack("HHHH", rows, cols, 0, 0)
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+    return master_fd, slave_fd
 
 
 class PTYServer:
@@ -34,7 +46,8 @@ class PTYServer:
         self.sock_path = str(socket_path_for(session_id))
         self.foreground = foreground
 
-        self.child: pexpect.spawn | None = None
+        self._master_fd: int | None = None
+        self._proc: subprocess.Popen | None = None
         self.exited = False
         self.exit_code = None
         self.exit_signal = None
@@ -47,9 +60,16 @@ class PTYServer:
 
     async def start(self):
         self._loop = asyncio.get_running_loop()
-        self.child = pexpect.spawn(
-            self.command, encoding=None, dimensions=(self.rows, self.cols),
+
+        master_fd, slave_fd = _open_pty(self.rows, self.cols)
+        self._proc = subprocess.Popen(
+            shlex.split(self.command),
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            close_fds=True, start_new_session=True,
         )
+        os.close(slave_fd)
+        self._master_fd = master_fd
+
         register_session(self.session_id, self.command, os.getpid(), self.sock_path)
         self._server = await asyncio.start_unix_server(
             self._handle_client, path=self.sock_path
@@ -72,24 +92,36 @@ class PTYServer:
         """Background thread: continuously reads from PTY and dispatches to asyncio."""
         while True:
             try:
-                raw = self.child.read_nonblocking(size=4096, timeout=1.0)
-            except pexpect.TIMEOUT:
+                ready, _, _ = select.select([self._master_fd], [], [], 1.0)
+            except (ValueError, OSError):
+                # fd closed
+                break
+            if not ready:
                 continue
-            except pexpect.EOF:
-                try:
-                    self.child.close()
-                    exit_code = self.child.exitstatus
-                    exit_signal = self.child.signalstatus
-                except Exception:
-                    exit_code = None
-                    exit_signal = None
-                self._loop.call_soon_threadsafe(self._on_eof, exit_code, exit_signal)
+            try:
+                raw = os.read(self._master_fd, 4096)
+            except OSError:
+                # EIO means the slave side closed (child exited)
+                raw = b""
+            if not raw:
+                self._collect_exit_status()
                 return
-            except Exception:
-                return
+            self._loop.call_soon_threadsafe(self._on_data, raw)
 
-            if raw:
-                self._loop.call_soon_threadsafe(self._on_data, raw)
+    def _collect_exit_status(self):
+        """Wait for the child to finish and dispatch exit info to asyncio."""
+        exit_code = None
+        exit_signal = None
+        try:
+            self._proc.wait(timeout=5.0)
+            rc = self._proc.returncode
+            if rc >= 0:
+                exit_code = rc
+            else:
+                exit_signal = -rc
+        except Exception:
+            pass
+        self._loop.call_soon_threadsafe(self._on_eof, exit_code, exit_signal)
 
     def _stdin_loop(self):
         """Background thread: reads stdin line-by-line, forwards to PTY."""
@@ -97,7 +129,7 @@ class PTYServer:
             for line in sys.stdin:
                 if self.exited:
                     break
-                self.child.send(line.encode("utf-8"))
+                os.write(self._master_fd, line.encode("utf-8"))
         except (EOFError, OSError):
             pass
 
@@ -164,7 +196,8 @@ class PTYServer:
         text = msg.get("text", "")
         if self.exited:
             return {"status": "error", "error": "Session has exited"}
-        self.child.send(text.encode("utf-8") if isinstance(text, str) else text)
+        data = text.encode("utf-8") if isinstance(text, str) else text
+        os.write(self._master_fd, data)
         return {"status": "ok"}
 
     async def _do_read(self, msg: dict) -> dict:
@@ -246,11 +279,18 @@ class PTYServer:
         return result
 
     async def _shutdown(self):
-        if self.child and self.child.isalive():
+        if self._proc and self._proc.poll() is None:
             try:
-                self.child.terminate(force=True)
-            except Exception:
+                self._proc.kill()
+            except ProcessLookupError:
                 pass
+
+        if self._master_fd is not None:
+            try:
+                os.close(self._master_fd)
+            except OSError:
+                pass
+            self._master_fd = None
 
         if self._server:
             self._server.close()
