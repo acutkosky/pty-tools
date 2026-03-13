@@ -23,7 +23,9 @@ from pty_tools.common import (
     socket_path_for,
     unregister_session,
 )
-from pty_tools.screen import ScreenTracker
+
+# Regex to strip ANSI escape sequences from raw output
+_ANSI_RE = re.compile(r"\x1b\[[\x20-\x3f]*[0-9;]*[\x20-\x7e]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[>=<]")
 
 
 def _open_pty(rows: int, cols: int):
@@ -51,7 +53,6 @@ class PTYServer:
         self.exited = False
         self.exit_code = None
         self.exit_signal = None
-        self.screen_tracker = ScreenTracker(rows=rows, cols=cols)
         self.read_lock = asyncio.Lock()
         self.read_buffer = bytearray()
         self._server: asyncio.Server | None = None
@@ -135,7 +136,6 @@ class PTYServer:
 
     def _on_data(self, raw: bytes):
         """Called on asyncio thread when PTY produces output."""
-        self.screen_tracker.update_state(raw)
         self.read_buffer.extend(raw)
         if self.foreground:
             sys.stdout.buffer.write(raw)
@@ -206,7 +206,6 @@ class PTYServer:
         pattern = msg.get("pattern")
         strip_ansi = msg.get("strip_ansi", True)
         peek = msg.get("peek", False)
-        mode = msg.get("mode", "auto")
 
         async with self.read_lock:
             start = time.monotonic()
@@ -231,7 +230,7 @@ class PTYServer:
                 if remaining <= 0:
                     break
 
-                if got_output and stable_timeout >= 0:
+                if got_output:
                     wait_time = min(stable_timeout, remaining)
                 else:
                     wait_time = remaining
@@ -270,11 +269,10 @@ class PTYServer:
                 if not peek:
                     self.read_buffer.clear()
 
-            output = self.screen_tracker.process_output(
-                show, strip_ansi=strip_ansi, mode=mode,
-            )
-            result["response"] = output["text"]
-            result["mode"] = output["mode"]
+            text = show.decode("utf-8", errors="replace")
+            if strip_ansi:
+                text = _ANSI_RE.sub("", text)
+            result["response"] = text
 
         return result
 

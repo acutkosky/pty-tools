@@ -73,7 +73,6 @@ class TestFullLifecycle:
         assert result["status"] == "ok"
         assert not result["exited"]
         assert "hello_world" in result["response"]
-        assert result["mode"] == "raw"
 
         # Exit
         result = send_request(self.session_id, {"type": "exit"}, timeout=10.0)
@@ -112,7 +111,6 @@ class TestFullLifecycle:
         )
         assert read_result["status"] == "ok"
         assert "test_output_123" in read_result["response"]
-        assert read_result["mode"] == "raw"
 
     def test_pattern_matching(self):
         result = daemonize_server(self.session_id, "sh")
@@ -233,7 +231,7 @@ class TestFullLifecycle:
         assert "\x1b" not in result_default["response"]
 
         # With strip_ansi=False, escapes should be preserved
-        result_raw = send_request(
+        result_with_ansi = send_request(
             self.session_id,
             {
                 "type": "interact",
@@ -244,8 +242,8 @@ class TestFullLifecycle:
             },
             timeout=10.0,
         )
-        assert result_raw["status"] == "ok"
-        assert "hello" in result_raw["response"]
+        assert result_with_ansi["status"] == "ok"
+        assert "hello" in result_with_ansi["response"]
 
     def test_spawn_bad_command_reports_error(self):
         """Spawning a nonexistent command should report a meaningful error."""
@@ -267,81 +265,6 @@ class TestFullLifecycle:
         assert read_result["status"] == "ok"
         assert "exited" in read_result
         assert "response" in read_result
-        assert "mode" in read_result
-
-
-class TestMode:
-    def setup_method(self):
-        self.session_id = f"test_{os.getpid()}_{int(time.time() * 1000)}"
-
-    def teardown_method(self):
-        _cleanup_session(self.session_id)
-
-    def _spawn(self):
-        result = daemonize_server(self.session_id, "sh")
-        assert result["status"] == "ok"
-        # Drain initial output
-        time.sleep(0.3)
-        send_request(
-            self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
-            timeout=5.0,
-        )
-
-    def test_mode_screen_on_non_tui(self):
-        """Forcing mode='screen' on a plain shell should return pyte-rendered output."""
-        self._spawn()
-
-        result = send_request(
-            self.session_id,
-            {
-                "type": "interact",
-                "text": "echo screen_mode_test\n",
-                "total_timeout": 3000,
-                "stable_timeout": 500,
-                "mode": "screen",
-            },
-            timeout=10.0,
-        )
-        assert result["status"] == "ok"
-        assert result["mode"] == "screen"
-        assert "screen_mode_test" in result["response"]
-
-    def test_mode_raw_always_returns_raw(self):
-        """Forcing mode='raw' should always return raw decoded bytes."""
-        self._spawn()
-
-        result = send_request(
-            self.session_id,
-            {
-                "type": "interact",
-                "text": "echo raw_mode_test\n",
-                "total_timeout": 3000,
-                "stable_timeout": 500,
-                "mode": "raw",
-            },
-            timeout=10.0,
-        )
-        assert result["status"] == "ok"
-        assert result["mode"] == "raw"
-        assert "raw_mode_test" in result["response"]
-
-    def test_mode_auto_default(self):
-        """Default mode='auto' should behave as before (raw for non-TUI)."""
-        self._spawn()
-
-        result = send_request(
-            self.session_id,
-            {
-                "type": "interact",
-                "text": "echo auto_test\n",
-                "total_timeout": 3000,
-                "stable_timeout": 500,
-            },
-            timeout=10.0,
-        )
-        assert result["status"] == "ok"
-        assert result["mode"] == "raw"
 
 
 class TestPeek:
@@ -496,10 +419,10 @@ class TestPeek:
         assert "MARKER" in result["response"]
 
     def test_peek_preserves_content_through_clear(self):
-        """Peek buffers raw bytes, so content survives a screen clear."""
+        """Peek buffers output, so content survives a screen clear."""
         self._spawn()
 
-        # Write and peek — buffers "visible_text" in raw bytes
+        # Write and peek — buffers "visible_text"
         peek = send_request(
             self.session_id,
             {
@@ -526,8 +449,8 @@ class TestPeek:
             timeout=10.0,
         )
         assert result["status"] == "ok"
-        # In raw mode, the peek buffer still has the old bytes — "visible_text"
-        # persists even though a clear was sent, because the raw bytes are accumulated
+        # The peek buffer still has the old bytes — "visible_text"
+        # persists even though a clear was sent, because bytes are accumulated
         assert "visible_text_999" in result["response"]
 
     def test_no_peek_clear_loses_content(self):
@@ -560,7 +483,7 @@ class TestPeek:
         assert result["status"] == "ok"
         assert "gone_text_888" not in result["response"]
 
-    def test_read_consumes_in_raw_mode(self):
+    def test_read_consumes_output(self):
         """A normal read consumes output so the next read only shows new data."""
         self._spawn()
 
@@ -590,52 +513,6 @@ class TestPeek:
         assert result["status"] == "ok"
         assert "fresh_bbb" in result["response"]
         assert "consumed_aaa" not in result["response"]
-
-    def test_screen_mode_peek_and_read_identical(self):
-        """In screen mode (alternate screen), peek and read show the same
-        screen state because pyte renders the live screen regardless of
-        the peek buffer."""
-        self._spawn()
-
-        # Use python to enter alternate screen, write text, and exit
-        # First peek-read to capture the screen state
-        send_request(
-            self.session_id,
-            {
-                "type": "write",
-                "text": (
-                    "python3 -c \""
-                    "import sys;"
-                    "sys.stdout.write('\\x1b[?1049h');"  # enter alt screen
-                    "sys.stdout.write('\\x1b[2J\\x1b[H');"  # clear + home
-                    "sys.stdout.write('SCREEN_CONTENT_XYZ\\n');"
-                    "sys.stdout.flush();"
-                    "import time; time.sleep(5);"
-                    "sys.stdout.write('\\x1b[?1049l');"  # leave alt screen
-                    "\"\n"
-                ),
-            },
-        )
-        time.sleep(0.5)
-
-        # Peek while in alternate screen
-        peek = send_request(
-            self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300, "peek": True},
-            timeout=5.0,
-        )
-        assert peek["mode"] == "screen"
-        assert "SCREEN_CONTENT_XYZ" in peek["response"]
-
-        # Normal read while still in alternate screen — should show same content
-        normal = send_request(
-            self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
-            timeout=5.0,
-        )
-        assert normal["mode"] == "screen"
-        assert "SCREEN_CONTENT_XYZ" in normal["response"]
-
 
 class TestForeground:
     """Tests for foreground (non-detached) spawn mode."""
@@ -794,7 +671,6 @@ class TestForeground:
         assert fg_result["status"] == det_result["status"] == "ok"
         assert "parity_check" in fg_result["response"]
         assert "parity_check" in det_result["response"]
-        assert fg_result["mode"] == det_result["mode"]
 
     def test_cli_detach_flag(self):
         """CLI --detach flag should daemonize like the old default behavior."""
