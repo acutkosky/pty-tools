@@ -96,6 +96,28 @@ def cmd_interact(args):
     _send_read(args.id, msg)
 
 
+def cmd_tap(args):
+    try:
+        result = send_request(args.out_id, {"type": "tap", "target": args.in_id})
+        print(json.dumps(result))
+        if result.get("status") != "ok":
+            sys.exit(1)
+    except PTYClientError as e:
+        print(json.dumps({"status": "error", "error": str(e)}))
+        sys.exit(1)
+
+
+def cmd_untap(args):
+    try:
+        result = send_request(args.out_id, {"type": "untap", "target": args.in_id})
+        print(json.dumps(result))
+        if result.get("status") != "ok":
+            sys.exit(1)
+    except PTYClientError as e:
+        print(json.dumps({"status": "error", "error": str(e)}))
+        sys.exit(1)
+
+
 def cmd_list(args):
     registry = read_registry()
     active = []
@@ -173,6 +195,18 @@ def main(argv=None):
     p.add_argument("--input", dest="input_text", required=True, help="Text to send")
     _add_read_args(p)
     p.set_defaults(func=cmd_interact)
+
+    # tap
+    p = sub.add_parser("tap", help="Forward output of one session to input of another")
+    p.add_argument("out_id", help="Source session (whose output to forward)")
+    p.add_argument("in_id", help="Target session (whose stdin receives the output)")
+    p.set_defaults(func=cmd_tap)
+
+    # untap
+    p = sub.add_parser("untap", help="Remove a tap")
+    p.add_argument("out_id", help="Source session")
+    p.add_argument("in_id", help="Target session")
+    p.set_defaults(func=cmd_untap)
 
     # list
     p = sub.add_parser("list", help="List active sessions")

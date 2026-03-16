@@ -5,6 +5,7 @@ import asyncio
 import fcntl
 import json
 import os
+import queue
 import pty as pty_mod
 import re
 import select
@@ -19,7 +20,10 @@ import threading
 import time
 
 from pty_tools.common import (
+    PTYClientError,
+    is_server_alive,
     register_session,
+    send_request,
     socket_path_for,
     unregister_session,
 )
@@ -58,6 +62,9 @@ class PTYServer:
         self._server: asyncio.Server | None = None
         self._new_data = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self.tap_targets: set[str] = set()  # session IDs to forward output to
+        self._tap_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
+        self._tap_thread: threading.Thread | None = None
 
     async def start(self):
         self._loop = asyncio.get_running_loop()
@@ -140,7 +147,33 @@ class PTYServer:
         if self.foreground:
             sys.stdout.buffer.write(raw)
             sys.stdout.buffer.flush()
+        self._forward_to_taps(raw)
         self._new_data.set()
+
+    def _forward_to_taps(self, raw: bytes):
+        """Forward output to all tap targets, preserving ordering."""
+        if not self.tap_targets:
+            return
+        if self._tap_thread is None or not self._tap_thread.is_alive():
+            self._tap_thread = threading.Thread(target=self._tap_worker, daemon=True)
+            self._tap_thread.start()
+        text = raw.decode("utf-8", errors="replace")
+        for target_id in list(self.tap_targets):
+            self._tap_queue.put((target_id, text))
+
+    def _tap_worker(self):
+        """Single worker thread that drains the tap queue in order."""
+        while True:
+            item = self._tap_queue.get()
+            if item is None:
+                return
+            target_id, text = item
+            if target_id not in self.tap_targets:
+                continue
+            try:
+                send_request(target_id, {"type": "write", "text": text}, timeout=5.0)
+            except Exception:
+                self.tap_targets.discard(target_id)
 
     def _on_eof(self, exit_code, exit_signal):
         """Called on asyncio thread when PTY child exits."""
@@ -169,6 +202,10 @@ class PTYServer:
                     response = write_result
                 else:
                     response = await self._do_read(msg)
+            elif msg_type == "tap":
+                response = self._do_tap(msg)
+            elif msg_type == "untap":
+                response = self._do_untap(msg)
             elif msg_type == "exit":
                 response = {"status": "ok", "message": "Shutting down"}
                 shutdown_after = True
@@ -191,6 +228,22 @@ class PTYServer:
                 pass
             if shutdown_after:
                 await self._shutdown()
+
+    def _do_tap(self, msg: dict) -> dict:
+        target_id = msg.get("target")
+        if not target_id:
+            return {"status": "error", "error": "Missing 'target' session ID"}
+        if not is_server_alive(target_id):
+            return {"status": "error", "error": f"Target session '{target_id}' is not running"}
+        self.tap_targets.add(target_id)
+        return {"status": "ok", "message": f"Tapping output to '{target_id}'"}
+
+    def _do_untap(self, msg: dict) -> dict:
+        target_id = msg.get("target")
+        if not target_id:
+            return {"status": "error", "error": "Missing 'target' session ID"}
+        self.tap_targets.discard(target_id)
+        return {"status": "ok", "message": f"Removed tap to '{target_id}'"}
 
     def _do_write(self, msg: dict) -> dict:
         text = msg.get("text", "")

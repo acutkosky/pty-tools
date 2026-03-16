@@ -110,6 +110,29 @@ pty interact <id> --input TEXT [--total_timeout 5000] [--stable_timeout 500] [--
 
 Atomic write-then-read. Sends `TEXT` and reads the response in a single operation, avoiding race conditions between separate write and read calls.
 
+### pty tap
+
+```
+pty tap <out_id> <in_id>
+```
+
+Forward all output from one session to the stdin of another. Output is delivered in order via a dedicated worker thread. Multiple taps from the same source are supported — each target receives a copy independently.
+
+```bash
+# Wire output of "builder" into stdin of "logger"
+pty tap builder logger
+```
+
+If the target session exits or becomes unreachable, the tap is automatically removed. The source session continues operating normally.
+
+### pty untap
+
+```
+pty untap <out_id> <in_id>
+```
+
+Remove a previously established tap. Untapping a target that was never tapped is a no-op.
+
 ### pty list
 
 ```
@@ -132,9 +155,11 @@ Each session is a server process that:
 1. Spawns the child process in a PTY (using stdlib `pty` + `subprocess`)
 2. Runs a background reader thread that continuously reads PTY output into a buffer
 3. Listens on a Unix domain socket at `/tmp/pty_sessions/session_<id>.sock`
-4. Handles JSON messages from clients (write, read, interact, exit)
+4. Handles JSON messages from clients (write, read, interact, tap, untap, exit)
 
 In foreground mode, the reader thread also streams raw PTY output to stdout, and a separate thread forwards stdin to the PTY. In detached mode (`--detach`), stdin/stdout are disconnected and the process runs independently.
+
+Taps are implemented as a set of target session IDs on the server. When new output arrives, each chunk is queued and sent to targets sequentially by a single worker thread, preserving ordering. Failed sends (target exited, socket gone) automatically remove the tap.
 
 Reads are serialized (one at a time) via an async lock. The read waits on an event that the background reader signals whenever new data arrives, implementing the timeout and pattern-matching logic reactively.
 

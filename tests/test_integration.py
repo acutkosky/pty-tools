@@ -688,3 +688,247 @@ class TestForeground:
         assert is_server_alive(self.session_id)
 
         send_request(self.session_id, {"type": "exit"}, timeout=10.0)
+
+
+class TestTap:
+    """Tests for tap/untap — forwarding output between sessions."""
+
+    def setup_method(self):
+        ts = int(time.time() * 1000)
+        self.src_id = f"tap_src_{os.getpid()}_{ts}"
+        self.dst_id = f"tap_dst_{os.getpid()}_{ts}"
+        self.dst2_id = f"tap_dst2_{os.getpid()}_{ts}"
+
+    def teardown_method(self):
+        for sid in (self.src_id, self.dst_id, self.dst2_id):
+            _cleanup_session(sid)
+
+    def _spawn(self, session_id):
+        result = daemonize_server(session_id, "sh")
+        assert result["status"] == "ok"
+        time.sleep(0.3)
+        # Drain initial output
+        send_request(
+            session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+    def test_tap_forwards_output(self):
+        """Output from src should appear as input in dst."""
+        self._spawn(self.src_id)
+        self._spawn(self.dst_id)
+
+        # Set up tap: src -> dst
+        result = send_request(self.src_id, {"type": "tap", "target": self.dst_id})
+        assert result["status"] == "ok"
+
+        # Generate output on src
+        send_request(
+            self.src_id,
+            {
+                "type": "interact",
+                "text": "echo tap_fwd_test\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        # Give tap time to forward
+        time.sleep(1.0)
+
+        # Read from dst — should see the forwarded output
+        dst_result = send_request(
+            self.dst_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert dst_result["status"] == "ok"
+        assert "tap_fwd_test" in dst_result["response"]
+
+    def test_untap_stops_forwarding(self):
+        """After untap, output should no longer be forwarded."""
+        self._spawn(self.src_id)
+        self._spawn(self.dst_id)
+
+        # Tap then untap
+        send_request(self.src_id, {"type": "tap", "target": self.dst_id})
+        result = send_request(self.src_id, {"type": "untap", "target": self.dst_id})
+        assert result["status"] == "ok"
+
+        # Generate output on src
+        send_request(
+            self.src_id,
+            {
+                "type": "interact",
+                "text": "echo after_untap\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        time.sleep(1.0)
+
+        # dst should have no new output (just timeout with empty response)
+        dst_result = send_request(
+            self.dst_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+        assert dst_result["status"] == "ok"
+        assert "after_untap" not in dst_result["response"]
+
+    def test_tap_does_not_consume_src_read_buffer(self):
+        """Tapping should not interfere with normal reads on src."""
+        self._spawn(self.src_id)
+        self._spawn(self.dst_id)
+
+        send_request(self.src_id, {"type": "tap", "target": self.dst_id})
+
+        # Generate output and read from src — should still work normally
+        result = send_request(
+            self.src_id,
+            {
+                "type": "interact",
+                "text": "echo src_read_test\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "src_read_test" in result["response"]
+
+    def test_multiple_taps_independent(self):
+        """Multiple taps from the same src should each receive output independently."""
+        self._spawn(self.src_id)
+        self._spawn(self.dst_id)
+        self._spawn(self.dst2_id)
+
+        # Tap src -> dst and src -> dst2
+        send_request(self.src_id, {"type": "tap", "target": self.dst_id})
+        send_request(self.src_id, {"type": "tap", "target": self.dst2_id})
+
+        # Generate output on src
+        send_request(
+            self.src_id,
+            {
+                "type": "interact",
+                "text": "echo multi_tap_test\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        time.sleep(1.0)
+
+        # Both dst and dst2 should have the output
+        dst_result = send_request(
+            self.dst_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        dst2_result = send_request(
+            self.dst2_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert "multi_tap_test" in dst_result["response"]
+        assert "multi_tap_test" in dst2_result["response"]
+
+    def test_multiple_taps_untap_one(self):
+        """Untapping one target should not affect the other."""
+        self._spawn(self.src_id)
+        self._spawn(self.dst_id)
+        self._spawn(self.dst2_id)
+
+        send_request(self.src_id, {"type": "tap", "target": self.dst_id})
+        send_request(self.src_id, {"type": "tap", "target": self.dst2_id})
+
+        # Remove only dst
+        send_request(self.src_id, {"type": "untap", "target": self.dst_id})
+
+        # Generate output
+        send_request(
+            self.src_id,
+            {
+                "type": "interact",
+                "text": "echo partial_untap\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        time.sleep(1.0)
+
+        # dst should NOT have the output
+        dst_result = send_request(
+            self.dst_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+        assert "partial_untap" not in dst_result["response"]
+
+        # dst2 should still have it
+        dst2_result = send_request(
+            self.dst2_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert "partial_untap" in dst2_result["response"]
+
+    def test_tap_auto_cleanup_on_target_exit(self):
+        """When the target session exits, the tap should be auto-removed."""
+        self._spawn(self.src_id)
+        self._spawn(self.dst_id)
+
+        send_request(self.src_id, {"type": "tap", "target": self.dst_id})
+
+        # Kill dst
+        send_request(self.dst_id, {"type": "exit"}, timeout=10.0)
+        time.sleep(1.0)
+
+        # Generate output on src — the tap send should fail and auto-remove
+        send_request(
+            self.src_id,
+            {
+                "type": "interact",
+                "text": "echo after_dst_exit\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        # src should still be alive and working fine
+        result = send_request(
+            self.src_id,
+            {
+                "type": "interact",
+                "text": "echo still_alive\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "still_alive" in result["response"]
+
+    def test_tap_nonexistent_target(self):
+        """Tapping to a nonexistent session should return an error."""
+        self._spawn(self.src_id)
+
+        result = send_request(self.src_id, {"type": "tap", "target": "nonexistent_session"})
+        assert result["status"] == "error"
+        assert "not running" in result["error"]
+
+    def test_untap_nonexistent_is_noop(self):
+        """Untapping a target that was never tapped should succeed (no-op)."""
+        self._spawn(self.src_id)
+
+        result = send_request(self.src_id, {"type": "untap", "target": "never_tapped"})
+        assert result["status"] == "ok"
