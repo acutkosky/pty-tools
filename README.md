@@ -71,7 +71,7 @@ Send input to one or more sessions. Three modes:
 ### pty read
 
 ```
-pty read <id> [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi] [--peek]
+pty read <id> [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi] [--peek] [--screen]
 ```
 
 Read output since the last read. Returns JSON:
@@ -102,6 +102,13 @@ By default, a read **consumes** the output — subsequent reads only see new dat
 
 ANSI escape sequences are stripped by default. Use `--no_strip_ansi` to preserve them.
 
+Use `--screen` to get a snapshot of the virtual terminal screen instead of the read buffer. This uses [pyte](https://github.com/selectel/pyte) to maintain a virtual terminal that tracks all PTY output. The screen snapshot is independent of the read buffer — it doesn't consume it, and reflects what a user would currently see on the terminal (after cursor movement, clears, scrolling, etc.).
+
+```bash
+pty read myshell --screen
+# {"status": "ok", "response": "$ echo hello\nhello\n$ ", "rows": 24, "cols": 80}
+```
+
 ### pty interact
 
 ```
@@ -109,6 +116,37 @@ pty interact <id> --input TEXT [--total_timeout 5000] [--stable_timeout 500] [--
 ```
 
 Atomic write-then-read. Sends `TEXT` and reads the response in a single operation, avoiding race conditions between separate write and read calls.
+
+### pty resize
+
+```
+pty resize <id> --rows R --cols C
+```
+
+Resize the PTY. Updates the terminal size via `TIOCSWINSZ`, sends `SIGWINCH` to the child process group, and resizes the virtual terminal screen. The child process (e.g. vim, less, bash) will reflow its output to the new dimensions.
+
+```bash
+pty resize myshell --rows 40 --cols 120
+# {"status": "ok", "rows": 40, "cols": 120}
+```
+
+In foreground mode, `SIGWINCH` is automatically propagated — when the parent terminal is resized, the PTY and child process are updated to match.
+
+### pty signal
+
+```
+pty signal <id> <signal>
+```
+
+Send a signal to the child process group. Accepts signal names (`SIGTERM`, `TERM`) or numbers (`15`).
+
+```bash
+pty signal myshell TERM
+# {"status": "ok", "signal": "SIGTERM"}
+
+pty signal myshell 9
+# {"status": "ok", "signal": "SIGKILL"}
+```
 
 ### pty tap
 
@@ -157,7 +195,9 @@ Each session is a server process that:
 3. Listens on a Unix domain socket at `/tmp/pty_sessions/session_<id>.sock`
 4. Handles JSON messages from clients (write, read, interact, tap, untap, exit)
 
-In foreground mode, the reader thread also streams raw PTY output to stdout, and a separate thread forwards stdin to the PTY. In detached mode (`--detach`), stdin/stdout are disconnected and the process runs independently.
+A pyte virtual terminal (`Screen` + `Stream`) is fed inline in the reader path. This maintains a screen buffer that reflects what a user would see, independent of the read buffer. Screen snapshots are served via the `screen` message type.
+
+In foreground mode, the reader thread also streams raw PTY output to stdout, and a separate thread forwards stdin to the PTY. SIGWINCH is caught and propagated to the child. SIGTERM/SIGHUP are forwarded to the child process group before shutdown. In detached mode (`--detach`), stdin/stdout are disconnected and the process runs independently.
 
 Taps are implemented as a set of target session IDs on the server. When new output arrives, each chunk is queued and sent to targets sequentially by a single worker thread, preserving ordering. Failed sends (target exited, socket gone) automatically remove the tap.
 

@@ -87,6 +87,14 @@ def _send_read(session_id, msg):
 
 
 def cmd_read(args):
+    if args.screen:
+        try:
+            result = send_request(args.id, {"type": "screen"}, timeout=5.0)
+            print(json.dumps(result))
+        except PTYClientError as e:
+            print(json.dumps({"status": "error", "error": str(e)}))
+            sys.exit(1)
+        return
     _send_read(args.id, _build_read_msg(args, "read"))
 
 
@@ -94,6 +102,36 @@ def cmd_interact(args):
     msg = _build_read_msg(args, "interact")
     msg["text"] = args.input_text.encode("utf-8").decode("unicode_escape")
     _send_read(args.id, msg)
+
+
+def cmd_resize(args):
+    try:
+        result = send_request(
+            args.id,
+            {"type": "resize", "rows": args.rows, "cols": args.cols},
+            timeout=5.0,
+        )
+        print(json.dumps(result))
+        if result.get("status") != "ok":
+            sys.exit(1)
+    except PTYClientError as e:
+        print(json.dumps({"status": "error", "error": str(e)}))
+        sys.exit(1)
+
+
+def cmd_signal(args):
+    try:
+        result = send_request(
+            args.id,
+            {"type": "signal", "signal": args.signal},
+            timeout=5.0,
+        )
+        print(json.dumps(result))
+        if result.get("status") != "ok":
+            sys.exit(1)
+    except PTYClientError as e:
+        print(json.dumps({"status": "error", "error": str(e)}))
+        sys.exit(1)
 
 
 def cmd_tap(args):
@@ -167,7 +205,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     # spawn
-    p = sub.add_parser("spawn", help="Spawn a new PTY session")
+    p = sub.add_parser("spawn", help="Spawn a new PTY session",
+                        description="Spawn a process in a new PTY session. Runs in foreground by default (stdin forwarded, PTY output streamed to stdout). Use --detach to daemonize.")
     p.add_argument("id", help="Session identifier")
     p.add_argument("cmd", help="Command to run in the PTY")
     p.add_argument("--rows", type=int, default=24, help="Terminal rows (default: 24)")
@@ -177,43 +216,66 @@ def main(argv=None):
     p.set_defaults(func=cmd_spawn)
 
     # write
-    p = sub.add_parser("write", help="Send input to PTY session(s)")
+    p = sub.add_parser("write", help="Send input to PTY session(s)",
+                        description="Send input to one or more PTY sessions. Reads from stdin by default, or use --input for a literal string. Use --stream to send stdin line by line.")
     p.add_argument("id", nargs="+", help="Session identifier(s)")
     p.add_argument("--input", dest="input_text", help="Text to send (default: read from stdin)")
     p.add_argument("--stream", action="store_true", help="Send stdin line by line")
     p.set_defaults(func=cmd_write)
 
     # read
-    p = sub.add_parser("read", help="Read output from a PTY session")
+    p = sub.add_parser("read", help="Read output from a PTY session",
+                        description="Read output from a PTY session. Consumes the read buffer by default (use --peek to preserve it). Use --screen for a virtual terminal snapshot instead of the raw buffer.")
     p.add_argument("id", help="Session identifier")
+    p.add_argument("--screen", action="store_true", help="Return virtual terminal screen snapshot")
     _add_read_args(p)
     p.set_defaults(func=cmd_read)
 
     # interact
-    p = sub.add_parser("interact", help="Atomic write-then-read")
+    p = sub.add_parser("interact", help="Atomic write-then-read",
+                        description="Atomic write-then-read. Sends input and reads the response in a single operation, avoiding race conditions between separate write and read calls.")
     p.add_argument("id", help="Session identifier")
     p.add_argument("--input", dest="input_text", required=True, help="Text to send")
     _add_read_args(p)
     p.set_defaults(func=cmd_interact)
 
+    # resize
+    p = sub.add_parser("resize", help="Resize a PTY session",
+                        description="Resize the PTY terminal. Updates the terminal size, sends SIGWINCH to the child process group, and resizes the virtual terminal screen.")
+    p.add_argument("id", help="Session identifier")
+    p.add_argument("--rows", type=int, required=True, help="New row count")
+    p.add_argument("--cols", type=int, required=True, help="New column count")
+    p.set_defaults(func=cmd_resize)
+
+    # signal
+    p = sub.add_parser("signal", help="Send a signal to a PTY session",
+                        description="Send a signal to the child process group. Accepts signal names (SIGTERM, TERM) or numbers (15).")
+    p.add_argument("id", help="Session identifier")
+    p.add_argument("signal", help="Signal name (e.g. SIGTERM, TERM) or number")
+    p.set_defaults(func=cmd_signal)
+
     # tap
-    p = sub.add_parser("tap", help="Forward output of one session to input of another")
+    p = sub.add_parser("tap", help="Forward output of one session to input of another",
+                        description="Forward all output from one session to the stdin of another. Multiple taps from the same source are supported. Auto-removed if the target exits.")
     p.add_argument("out_id", help="Source session (whose output to forward)")
     p.add_argument("in_id", help="Target session (whose stdin receives the output)")
     p.set_defaults(func=cmd_tap)
 
     # untap
-    p = sub.add_parser("untap", help="Remove a tap")
+    p = sub.add_parser("untap", help="Remove a tap",
+                        description="Remove a previously established tap. Untapping a target that was never tapped is a no-op.")
     p.add_argument("out_id", help="Source session")
     p.add_argument("in_id", help="Target session")
     p.set_defaults(func=cmd_untap)
 
     # list
-    p = sub.add_parser("list", help="List active sessions")
+    p = sub.add_parser("list", help="List active sessions",
+                        description="List active sessions as a JSON array. Stale entries (dead server processes) are cleaned up automatically.")
     p.set_defaults(func=cmd_list)
 
     # exit
-    p = sub.add_parser("exit", help="Terminate a session")
+    p = sub.add_parser("exit", help="Terminate a session",
+                        description="Terminate a session. If the server is unresponsive, force-kills the process and cleans up the socket and registry.")
     p.add_argument("id", help="Session identifier")
     p.set_defaults(func=cmd_exit)
 

@@ -932,3 +932,218 @@ class TestTap:
 
         result = send_request(self.src_id, {"type": "untap", "target": "never_tapped"})
         assert result["status"] == "ok"
+
+
+class TestScreen:
+    """Tests for pyte-based screen capture."""
+
+    def setup_method(self):
+        self.session_id = f"test_scr_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_screen_returns_display(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        # Write something and wait for it to render
+        send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo screen_test_abc\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        # Get screen snapshot
+        screen = send_request(self.session_id, {"type": "screen"}, timeout=5.0)
+        assert screen["status"] == "ok"
+        assert "screen_test_abc" in screen["response"]
+        assert screen["rows"] == 24
+        assert screen["cols"] == 80
+
+    def test_screen_does_not_consume_read_buffer(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+        time.sleep(0.3)
+        # Drain initial output
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+        send_request(self.session_id, {"type": "write", "text": "echo buffer_check\n"})
+        time.sleep(0.5)
+
+        # Screen read should not consume the buffer
+        send_request(self.session_id, {"type": "screen"}, timeout=5.0)
+
+        # Normal read should still have the output
+        read_result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert "buffer_check" in read_result["response"]
+
+    def test_screen_after_resize(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        # Resize
+        resize_result = send_request(
+            self.session_id,
+            {"type": "resize", "rows": 40, "cols": 120},
+            timeout=5.0,
+        )
+        assert resize_result["status"] == "ok"
+        assert resize_result["rows"] == 40
+        assert resize_result["cols"] == 120
+
+        # Screen should reflect new dimensions
+        screen = send_request(self.session_id, {"type": "screen"}, timeout=5.0)
+        assert screen["rows"] == 40
+        assert screen["cols"] == 120
+
+
+class TestResize:
+    """Tests for PTY resize."""
+
+    def setup_method(self):
+        self.session_id = f"test_rsz_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_resize_updates_pty(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {"type": "resize", "rows": 50, "cols": 132},
+            timeout=5.0,
+        )
+        assert result["status"] == "ok"
+        assert result["rows"] == 50
+        assert result["cols"] == 132
+
+        # Verify the child sees the new size via stty
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "stty size\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "50 132" in result["response"]
+
+    def test_resize_missing_params(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {"type": "resize", "rows": 40},
+            timeout=5.0,
+        )
+        assert result["status"] == "error"
+        assert "cols" in result["error"]
+
+
+class TestSignal:
+    """Tests for sending signals to child process."""
+
+    def setup_method(self):
+        self.session_id = f"test_sig_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_signal_by_name(self):
+        """Sending SIGKILL should terminate the child."""
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {"type": "signal", "signal": "KILL"},
+            timeout=5.0,
+        )
+        assert result["status"] == "ok"
+        assert result["signal"] == "SIGKILL"
+
+        # Child should exit
+        time.sleep(1.0)
+        read_result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert read_result["exited"] is True
+
+    def test_signal_by_full_name(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {"type": "signal", "signal": "SIGTERM"},
+            timeout=5.0,
+        )
+        assert result["status"] == "ok"
+        assert result["signal"] == "SIGTERM"
+
+    def test_signal_by_number(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {"type": "signal", "signal": 15},  # SIGTERM
+            timeout=5.0,
+        )
+        assert result["status"] == "ok"
+        assert result["signal"] == "SIGTERM"
+
+    def test_signal_unknown(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {"type": "signal", "signal": "BOGUS"},
+            timeout=5.0,
+        )
+        assert result["status"] == "error"
+        assert "Unknown signal" in result["error"]
+
+    def test_signal_on_exited_session(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        # Exit the shell first
+        send_request(self.session_id, {"type": "write", "text": "exit\n"})
+        time.sleep(1.0)
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+        result = send_request(
+            self.session_id,
+            {"type": "signal", "signal": "TERM"},
+            timeout=5.0,
+        )
+        assert result["status"] == "error"
+        assert "exited" in result["error"]

@@ -10,6 +10,7 @@ import pty as pty_mod
 import re
 import select
 import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -18,6 +19,8 @@ import tempfile
 import termios
 import threading
 import time
+
+import pyte
 
 from pty_tools.common import (
     PTYClientError,
@@ -66,6 +69,10 @@ class PTYServer:
         self._tap_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
         self._tap_thread: threading.Thread | None = None
 
+        # pyte virtual terminal for screen capture
+        self._pyte_screen = pyte.Screen(cols, rows)
+        self._pyte_stream = pyte.Stream(self._pyte_screen)
+
     async def start(self):
         self._loop = asyncio.get_running_loop()
 
@@ -84,8 +91,20 @@ class PTYServer:
         )
         # Signal handlers only work on the main thread
         try:
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                self._loop.add_signal_handler(sig, lambda: asyncio.create_task(self._shutdown()))
+            if self.foreground:
+                # Foreground: forward SIGTERM/SIGHUP to child then shutdown
+                for sig in (signal.SIGTERM, signal.SIGHUP):
+                    self._loop.add_signal_handler(sig, self._on_forward_signal, sig)
+                # SIGINT: just shutdown (don't forward — child gets it from the terminal)
+                self._loop.add_signal_handler(
+                    signal.SIGINT, lambda: asyncio.create_task(self._shutdown()))
+                # SIGWINCH: propagate terminal size changes to child
+                self._loop.add_signal_handler(signal.SIGWINCH, self._on_sigwinch)
+            else:
+                # Background: SIGTERM/SIGINT → shutdown
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    self._loop.add_signal_handler(
+                        sig, lambda: asyncio.create_task(self._shutdown()))
         except RuntimeError:
             pass
 
@@ -144,6 +163,7 @@ class PTYServer:
     def _on_data(self, raw: bytes):
         """Called on asyncio thread when PTY produces output."""
         self.read_buffer.extend(raw)
+        self._pyte_stream.feed(raw.decode("utf-8", errors="replace"))
         if self.foreground:
             sys.stdout.buffer.write(raw)
             sys.stdout.buffer.flush()
@@ -206,6 +226,12 @@ class PTYServer:
                 response = self._do_tap(msg)
             elif msg_type == "untap":
                 response = self._do_untap(msg)
+            elif msg_type == "screen":
+                response = self._do_screen()
+            elif msg_type == "resize":
+                response = self._do_resize(msg)
+            elif msg_type == "signal":
+                response = self._do_signal(msg)
             elif msg_type == "exit":
                 response = {"status": "ok", "message": "Shutting down"}
                 shutdown_after = True
@@ -328,6 +354,79 @@ class PTYServer:
             result["response"] = text
 
         return result
+
+    def _on_forward_signal(self, sig):
+        """Forward a signal to the child process group, then shut down."""
+        if self._proc and self._proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self._proc.pid), sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        asyncio.create_task(self._shutdown())
+
+    def _on_sigwinch(self):
+        """Handle SIGWINCH in foreground mode — propagate terminal size to child."""
+        size = shutil.get_terminal_size()
+        self._do_resize({"rows": size.lines, "cols": size.columns})
+
+    def _do_screen(self) -> dict:
+        """Return the current virtual terminal screen contents."""
+        lines = [line.rstrip() for line in self._pyte_screen.display]
+        return {
+            "status": "ok",
+            "response": "\n".join(lines),
+            "rows": self._pyte_screen.lines,
+            "cols": self._pyte_screen.columns,
+        }
+
+    def _do_resize(self, msg: dict) -> dict:
+        """Resize the PTY and update the virtual terminal."""
+        rows = msg.get("rows")
+        cols = msg.get("cols")
+        if rows is None or cols is None:
+            return {"status": "error", "error": "Missing 'rows' or 'cols'"}
+        self.rows = rows
+        self.cols = cols
+        # Update the actual PTY size
+        if self._master_fd is not None:
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
+        # Signal the child process group
+        if self._proc and self._proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGWINCH)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        # Resize the virtual terminal
+        self._pyte_screen.resize(rows, cols)
+        return {"status": "ok", "rows": rows, "cols": cols}
+
+    def _do_signal(self, msg: dict) -> dict:
+        """Send a signal to the child process group."""
+        sig_value = msg.get("signal")
+        if sig_value is None:
+            return {"status": "error", "error": "Missing 'signal'"}
+        # Resolve signal name or number
+        if isinstance(sig_value, int):
+            try:
+                sig = signal.Signals(sig_value)
+            except ValueError:
+                return {"status": "error", "error": f"Unknown signal number: {sig_value}"}
+        else:
+            sig_name = sig_value.upper()
+            if not sig_name.startswith("SIG"):
+                sig_name = "SIG" + sig_name
+            try:
+                sig = signal.Signals[sig_name]
+            except KeyError:
+                return {"status": "error", "error": f"Unknown signal: {sig_value}"}
+        if self._proc is None or self._proc.poll() is not None:
+            return {"status": "error", "error": "Session has exited"}
+        try:
+            os.killpg(os.getpgid(self._proc.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            return {"status": "error", "error": str(e)}
+        return {"status": "ok", "signal": sig.name}
 
     async def _shutdown(self):
         if self._proc and self._proc.poll() is None:
