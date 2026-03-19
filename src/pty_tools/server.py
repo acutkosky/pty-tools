@@ -454,8 +454,8 @@ class PTYServer:
 
 
 def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
-               foreground: bool = False):
-    """Entry point for the server process."""
+               foreground: bool = False) -> int:
+    """Entry point for the server process. Returns the child's exit code (0 if unknown)."""
     server = PTYServer(session_id, command, rows=rows, cols=cols, foreground=foreground)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -466,6 +466,11 @@ def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
         pass
     finally:
         loop.close()
+    if server.exit_code is not None:
+        return server.exit_code
+    if server.exit_signal is not None:
+        return 128 + server.exit_signal
+    return 0
 
 
 def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 80) -> dict:
@@ -542,8 +547,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        run_server(args.session_id, args.command, rows=args.rows, cols=args.cols,
-                   foreground=args.foreground)
+        rc = run_server(args.session_id, args.command, rows=args.rows, cols=args.cols,
+                        foreground=args.foreground)
+        sys.exit(rc)
     except Exception as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)

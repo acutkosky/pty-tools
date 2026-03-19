@@ -36,7 +36,8 @@ def cmd_spawn(args):
             "pid": os.getpid(),
         }
         print(json.dumps(status), file=sys.stderr)
-        run_server(args.id, args.cmd, rows=args.rows, cols=args.cols, foreground=True)
+        rc = run_server(args.id, args.cmd, rows=args.rows, cols=args.cols, foreground=True)
+        sys.exit(rc)
 
 
 def cmd_write(args):

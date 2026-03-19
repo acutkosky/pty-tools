@@ -629,6 +629,38 @@ class TestForeground:
         proc.wait(timeout=10.0)
         assert proc.returncode is not None, "Server did not shut down after child exit"
 
+    def test_foreground_exit_code_zero(self):
+        """Foreground mode should forward exit code 0."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "spawn",
+             self.session_id, "sh -c 'exit 0'"],
+            capture_output=True, timeout=10,
+        )
+        assert proc.returncode == 0
+
+    def test_foreground_exit_code_nonzero(self):
+        """Foreground mode should forward non-zero exit codes."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "spawn",
+             self.session_id, "sh -c 'exit 42'"],
+            capture_output=True, timeout=10,
+        )
+        assert proc.returncode == 42
+
+    def test_foreground_exit_code_from_signal(self):
+        """Foreground mode should return 128+signal when child is killed."""
+        proc, stdin_w = self._spawn_foreground(command="sleep 60")
+
+        # Kill the child via the signal command
+        send_request(
+            self.session_id,
+            {"type": "signal", "signal": "KILL"},
+            timeout=5.0,
+        )
+        os.close(stdin_w)
+        proc.wait(timeout=10.0)
+        assert proc.returncode == 128 + 9  # SIGKILL = 9
+
     def test_foreground_and_detach_produce_same_results(self):
         """Socket interactions should produce identical results in both modes."""
         # Foreground
