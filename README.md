@@ -35,7 +35,7 @@ All commands are subcommands of `pty`. All responses are JSON.
 ### pty spawn
 
 ```
-pty spawn <id> <cmd> [--rows 24] [--cols 80] [--detach]
+pty spawn <id> <cmd> [--rows 24] [--cols 80] [--detach] [--time_limit SECONDS]
 ```
 
 Spawn a process in a new PTY session.
@@ -48,6 +48,13 @@ pty spawn myshell sh
 
 # Pipe input, capture output
 echo "ls -la" | pty spawn myshell sh > output.txt 2>/dev/null &
+```
+
+Use `--time_limit` to set a maximum lifetime in seconds. When the limit expires, the child process is killed and the session is cleaned up. If omitted, the process runs until it exits on its own or is explicitly terminated.
+
+```bash
+# Kill the process after 30 seconds
+pty spawn --detach --time_limit 30 myshell 'long-running-command'
 ```
 
 With `--detach`, the server runs as a detached background process — the command returns immediately once the session is ready. Detached sessions survive the parent process exiting (including SSH logout).
