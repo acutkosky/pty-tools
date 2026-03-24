@@ -24,7 +24,8 @@ def cmd_spawn(args):
         sys.exit(1)
 
     if args.detach:
-        result = daemonize_server(args.id, args.cmd, rows=args.rows, cols=args.cols)
+        result = daemonize_server(args.id, args.cmd, rows=args.rows, cols=args.cols,
+                                  time_limit=args.time_limit)
         print(json.dumps(result))
         if result["status"] != "ok":
             sys.exit(1)
@@ -36,7 +37,8 @@ def cmd_spawn(args):
             "pid": os.getpid(),
         }
         print(json.dumps(status), file=sys.stderr)
-        rc = run_server(args.id, args.cmd, rows=args.rows, cols=args.cols, foreground=True)
+        rc = run_server(args.id, args.cmd, rows=args.rows, cols=args.cols, foreground=True,
+                        time_limit=args.time_limit)
         sys.exit(rc)
 
 
@@ -214,6 +216,8 @@ def main(argv=None):
     p.add_argument("--cols", type=int, default=80, help="Terminal columns (default: 80)")
     p.add_argument("--detach", action="store_true",
                    help="Daemonize the server (default: run in foreground)")
+    p.add_argument("--time_limit", type=float, default=None,
+                   help="Maximum lifetime in seconds; process is killed when exceeded")
     p.set_defaults(func=cmd_spawn)
 
     # write

@@ -473,7 +473,8 @@ class TestPeek:
     def test_pattern_match_spans_peek_and_new_data(self):
         self._spawn()
 
-        send_request(self.session_id, {"type": "write", "text": "printf MAR"})
+        send_request(self.session_id, {"type": "write", "text": "cat\n"})
+        send_request(self.session_id, {"type": "write", "text": "MAR\n"})
         time.sleep(0.3)
 
         # Peek — buffers "MAR"
@@ -494,12 +495,12 @@ class TestPeek:
                 "type": "read",
                 "total_timeout": 5000,
                 "stable_timeout": 500,
-                "pattern": "MARKER",
+                "pattern": "MAR\r\nKER",
             },
             timeout=10.0,
         )
         assert result["status"] == "ok"
-        assert "MARKER" in result["response"]
+        assert "MAR\r\nKER" in result["response"]
 
     def test_peek_preserves_content_through_clear(self):
         """Peek buffers output, so content survives a screen clear."""
@@ -1047,6 +1048,106 @@ class TestTap:
 
         result = send_request(self.src_id, {"type": "untap", "target": "never_tapped"})
         assert result["status"] == "ok"
+
+
+class TestTimeLimit:
+    """Tests for the time_limit feature — automatic process termination."""
+
+    def setup_method(self):
+        self.session_id = f"test_tl_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_time_limit_kills_process(self):
+        """Process should be killed after time_limit expires."""
+        result = daemonize_server(self.session_id, "sleep 60", time_limit=2)
+        assert result["status"] == "ok"
+        assert is_server_alive(self.session_id)
+
+        # Wait for the time limit to expire
+        time.sleep(3.0)
+
+        assert not is_server_alive(self.session_id)
+
+    def test_time_limit_process_alive_before_expiry(self):
+        """Process should still be running before the time limit."""
+        result = daemonize_server(self.session_id, "sleep 60", time_limit=5)
+        assert result["status"] == "ok"
+
+        time.sleep(1.0)
+        assert is_server_alive(self.session_id)
+
+        # Interact should still work
+        read_result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+        assert read_result["status"] == "ok"
+        assert not read_result["exited"]
+
+    def test_no_time_limit_stays_alive(self):
+        """Without time_limit, process should stay alive indefinitely."""
+        result = daemonize_server(self.session_id, "sleep 60")
+        assert result["status"] == "ok"
+
+        time.sleep(2.0)
+        assert is_server_alive(self.session_id)
+
+    def test_time_limit_cleans_up_socket(self):
+        """Socket and registry should be cleaned up after time limit."""
+        result = daemonize_server(self.session_id, "sleep 60", time_limit=2)
+        assert result["status"] == "ok"
+        assert socket_path_for(self.session_id).exists()
+
+        time.sleep(3.0)
+
+        assert not socket_path_for(self.session_id).exists()
+
+    def test_time_limit_early_exit(self):
+        """If the process exits before the time limit, everything is fine."""
+        result = daemonize_server(self.session_id, "sh -c 'exit 0'", time_limit=10)
+        assert result["status"] == "ok"
+
+        time.sleep(1.0)
+
+        # Process exited on its own — read should show exited
+        read_result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 500},
+            timeout=5.0,
+        )
+        assert read_result["exited"] is True
+
+    def test_time_limit_foreground_mode(self):
+        """Foreground mode should also respect time_limit."""
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pty_tools.server",
+             self.session_id, "sleep 60", "--foreground", "--time_limit", "2"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Wait for the time limit to kill it
+        proc.wait(timeout=10.0)
+        assert proc.returncode is not None
+
+    def test_time_limit_via_cli(self):
+        """CLI --time_limit flag should work with --detach."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "spawn", "--detach",
+             "--time_limit", "2", self.session_id, "sleep 60"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert proc.returncode == 0
+        result = json.loads(proc.stdout)
+        assert result["status"] == "ok"
+
+        assert is_server_alive(self.session_id)
+        time.sleep(3.0)
+        assert not is_server_alive(self.session_id)
 
 
 class TestScreen:

@@ -50,13 +50,14 @@ class PTYServer:
     """Manages a single PTY session with an async Unix socket interface."""
 
     def __init__(self, session_id: str, command: str, rows: int = 24, cols: int = 80,
-                 foreground: bool = False):
+                 foreground: bool = False, time_limit: float | None = None):
         self.session_id = session_id
         self.command = command
         self.rows = rows
         self.cols = cols
         self.sock_path = str(socket_path_for(session_id))
         self.foreground = foreground
+        self.time_limit = time_limit
 
         self._master_fd: int | None = None
         self._proc: subprocess.Popen | None = None
@@ -110,6 +111,10 @@ class PTYServer:
                         sig, lambda: asyncio.create_task(self._shutdown()))
         except RuntimeError:
             pass
+
+        # Schedule time limit if set
+        if self.time_limit is not None:
+            self._loop.call_later(self.time_limit, self._on_time_limit)
 
         # Start background PTY reader thread
         threading.Thread(target=self._read_loop, daemon=True).start()
@@ -431,6 +436,11 @@ class PTYServer:
             return {"status": "error", "error": str(e)}
         return {"status": "ok", "signal": sig.name}
 
+    def _on_time_limit(self):
+        """Called when the time limit expires — kill the child and shut down."""
+        if not self.exited:
+            asyncio.create_task(self._shutdown())
+
     async def _shutdown(self):
         if self._proc and self._proc.poll() is None:
             try:
@@ -457,9 +467,10 @@ class PTYServer:
 
 
 def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
-               foreground: bool = False) -> int:
+               foreground: bool = False, time_limit: float | None = None) -> int:
     """Entry point for the server process. Returns the child's exit code (0 if unknown)."""
-    server = PTYServer(session_id, command, rows=rows, cols=cols, foreground=foreground)
+    server = PTYServer(session_id, command, rows=rows, cols=cols, foreground=foreground,
+                       time_limit=time_limit)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(server.start())
@@ -476,7 +487,8 @@ def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
     return 0
 
 
-def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 80) -> dict:
+def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
+                     time_limit: float | None = None) -> dict:
     """Launch a detached subprocess to run the PTY server. Returns status dict."""
     from pty_tools.common import ensure_socket_dir
 
@@ -488,9 +500,13 @@ def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 
     err_fd, err_path = tempfile.mkstemp(prefix="pty_err_")
     err_file = os.fdopen(err_fd, "w")
 
+    cmd_args = [sys.executable, "-m", "pty_tools.server", session_id, command,
+                "--rows", str(rows), "--cols", str(cols)]
+    if time_limit is not None:
+        cmd_args.extend(["--time_limit", str(time_limit)])
+
     proc = subprocess.Popen(
-        [sys.executable, "-m", "pty_tools.server", session_id, command,
-         "--rows", str(rows), "--cols", str(cols)],
+        cmd_args,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=err_file,
@@ -547,11 +563,12 @@ if __name__ == "__main__":
     parser.add_argument("--rows", type=int, default=24)
     parser.add_argument("--cols", type=int, default=80)
     parser.add_argument("--foreground", action="store_true")
+    parser.add_argument("--time_limit", type=float, default=None)
     args = parser.parse_args()
 
     try:
         rc = run_server(args.session_id, args.command, rows=args.rows, cols=args.cols,
-                        foreground=args.foreground)
+                        foreground=args.foreground, time_limit=args.time_limit)
         sys.exit(rc)
     except Exception as e:
         print(str(e), file=sys.stderr)
