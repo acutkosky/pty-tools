@@ -267,6 +267,89 @@ class TestFullLifecycle:
         assert "response" in read_result
 
 
+class TestNoEcho:
+    """Verify that writing to the PTY does not echo the input back in reads."""
+
+    def setup_method(self):
+        self.session_id = f"test_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def _spawn_and_drain(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+        time.sleep(0.5)
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+    def test_write_silent_command_produces_no_echo(self):
+        """Writing a command that produces no output should yield an empty read.
+
+        With TTY echo enabled, the written text itself would appear in the read
+        buffer even though the command produces no output.
+        """
+        self._spawn_and_drain()
+
+        # Variable assignment produces no shell output
+        send_request(self.session_id, {"type": "write", "text": "NOECHO_VAR_X9Z=1\n"})
+        time.sleep(0.5)
+
+        read_result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1500, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert read_result["status"] == "ok"
+        # The only output should be the next shell prompt — not the assignment text
+        assert "NOECHO_VAR_X9Z" not in read_result["response"]
+
+    def test_interact_output_is_exactly_command_output(self):
+        """interact should return only the command's output, not an echo of the input.
+
+        With echo enabled, 'printf X' would return both the echoed command text
+        and the output, doubling the visible content.
+        """
+        self._spawn_and_drain()
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "printf 'EXACT_OUTPUT_42'\n",
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        # printf with no newline: output should be exactly "EXACT_OUTPUT_42"
+        # followed by the next shell prompt. No echoed command text.
+        assert result["response"].startswith("EXACT_OUTPUT_42")
+        assert "printf" not in result["response"]
+
+    def test_write_then_read_exact_output(self):
+        """write + read should return exactly the command output, nothing more."""
+        self._spawn_and_drain()
+
+        send_request(self.session_id, {"type": "write", "text": "echo ONLY_THIS_LINE\n"})
+
+        read_result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert read_result["status"] == "ok"
+        lines = [l for l in read_result["response"].strip().splitlines() if l.strip()]
+        # Should be exactly: the output line, then possibly a prompt
+        assert lines[0] == "ONLY_THIS_LINE"
+        # The command text itself must not appear anywhere
+        assert "echo ONLY_THIS_LINE" not in read_result["response"]
+
+
 class TestPeek:
     def setup_method(self):
         self.session_id = f"test_{os.getpid()}_{int(time.time() * 1000)}"

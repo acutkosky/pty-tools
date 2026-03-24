@@ -38,6 +38,9 @@ _ANSI_RE = re.compile(r"\x1b\[[\x20-\x3f]*[0-9;]*[\x20-\x7e]|\x1b\].*?(?:\x07|\x
 def _open_pty(rows: int, cols: int):
     """Create a PTY pair and set the terminal size. Returns (master_fd, slave_fd)."""
     master_fd, slave_fd = pty_mod.openpty()
+    settings = termios.tcgetattr(master_fd)
+    settings[3] = settings[3] & ~termios.ECHO
+    termios.tcsetattr(master_fd, termios.TCSADRAIN, settings)
     winsize = struct.pack("HHHH", rows, cols, 0, 0)
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
     return master_fd, slave_fd
