@@ -30,7 +30,7 @@ pty exit myshell
 
 ## Commands
 
-All commands are subcommands of `pty`. All responses are JSON.
+All commands are subcommands of `pty`. All responses are JSON. Every response includes a `"status"` field: `"ok"` on success, `"error"` on failure. Error responses include an `"error"` field with a description.
 
 ### pty spawn
 
@@ -45,6 +45,9 @@ By default, the server runs in the **foreground**: stdin is forwarded to the PTY
 ```bash
 # Foreground — interactive, stdout is a live tap of PTY output
 pty spawn myshell sh
+# stderr: {"status": "ok", "session_id": "myshell", "command": "sh", "pid": 12345}
+# stdout: raw PTY output
+# exit code: child's exit code
 
 # Pipe input, capture output
 echo "ls -la" | pty spawn myshell sh > output.txt 2>/dev/null &
@@ -75,6 +78,11 @@ Send input to one or more sessions. Three modes:
 - `--stream` — send stdin line by line (each line is delivered atomically)
 - *(default)* — read all of stdin, send as one chunk
 
+```bash
+pty write myshell --input 'echo hello\n'
+# {"session_id": "myshell", "status": "ok"}
+```
+
 ### pty read
 
 ```
@@ -101,8 +109,6 @@ When the child process exits, includes exit status:
 }
 ```
 
-All responses include `"status"`: `"ok"` on success, `"error"` on failure.
-
 **Timeout behavior:** Wait up to `total_timeout` ms for the first byte. Once output starts, return after `stable_timeout` ms of silence (or when `total_timeout` expires, whichever comes first). If `--pattern` is given, return as soon as the output matches the regex.
 
 By default, a read **consumes** the output — subsequent reads only see new data. Use `--peek` to read without consuming: the output is buffered and included in the next read. A normal read (without `--peek`) clears the buffer. This is useful for monitoring a session without interfering with a primary reader.
@@ -122,7 +128,12 @@ pty read myshell --screen
 pty interact <id> --input TEXT [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi] [--peek]
 ```
 
-Atomic write-then-read. Sends `TEXT` and reads the response in a single operation, avoiding race conditions between separate write and read calls.
+Atomic write-then-read. Sends `TEXT` and reads the response in a single operation, avoiding race conditions between separate write and read calls. Output format is the same as `pty read`:
+
+```bash
+pty interact myshell --input 'echo hello\n'
+# {"status": "ok", "exited": false, "response": "echo hello\r\nhello\r\n$ "}
+```
 
 ### pty resize
 
@@ -164,8 +175,8 @@ pty tap <out_id> <in_id>
 Forward all output from one session to the stdin of another. Output is delivered in order via a dedicated worker thread. Multiple taps from the same source are supported — each target receives a copy independently.
 
 ```bash
-# Wire output of "builder" into stdin of "logger"
 pty tap builder logger
+# {"status": "ok", "message": "Tapping output to 'logger'"}
 ```
 
 If the target session exits or becomes unreachable, the tap is automatically removed. The source session continues operating normally.
@@ -178,6 +189,11 @@ pty untap <out_id> <in_id>
 
 Remove a previously established tap. Untapping a target that was never tapped is a no-op.
 
+```bash
+pty untap builder logger
+# {"status": "ok", "message": "Removed tap to 'logger'"}
+```
+
 ### pty list
 
 ```
@@ -186,6 +202,11 @@ pty list
 
 List active sessions as a JSON array. Stale entries (dead server processes) are cleaned up automatically.
 
+```bash
+pty list
+# [{"session_id": "myshell", "command": "sh", "pid": 12345, "socket_path": "/tmp/pty_sessions/session_myshell.sock", "created_at": 1711234567.89}]
+```
+
 ### pty exit
 
 ```
@@ -193,6 +214,11 @@ pty exit <id>
 ```
 
 Terminate a session. If the server is unresponsive, force-kills the process and cleans up the socket and registry.
+
+```bash
+pty exit myshell
+# {"status": "ok", "message": "Shutting down"}
+```
 
 ## Architecture
 
