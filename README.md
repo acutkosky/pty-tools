@@ -225,7 +225,7 @@ pty exit myshell
 Each session is a server process that:
 1. Spawns the child process in a PTY (using stdlib `pty` + `subprocess`)
 2. Runs a background reader thread that continuously reads PTY output into a buffer
-3. Listens on a Unix domain socket at `/tmp/pty_sessions/session_<id>.sock`
+3. Listens on a Unix domain socket at `<socket_dir>/session_<id>.sock` (default `/tmp/pty_sessions`, override with `$PTY_SOCKET_DIR` or the `--socket-dir` flag)
 4. Handles JSON messages from clients (write, read, interact, tap, untap, exit)
 
 A pyte virtual terminal (`Screen` + `Stream`) is fed inline in the reader path. This maintains a screen buffer that reflects what a user would see, independent of the read buffer. Screen snapshots are served via the `screen` message type.
@@ -236,7 +236,7 @@ Taps are implemented as a set of target session IDs on the server. When new outp
 
 Reads are serialized (one at a time) via an async lock. The read waits on an event that the background reader signals whenever new data arrives, implementing the timeout and pattern-matching logic reactively.
 
-A shared registry at `/tmp/pty_sessions/registry.json` (protected by `flock`) tracks active sessions.
+A shared registry at `<socket_dir>/registry.json` (protected by `flock`) tracks active sessions. The socket directory can be configured via the `PTY_SOCKET_DIR` environment variable or the top-level `pty --socket-dir <path>` flag; both client and server invocations must agree on the value (the `--socket-dir` flag sets the env var so that daemonized servers inherit it).
 
 ## Tests
 

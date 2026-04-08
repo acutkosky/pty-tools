@@ -1,9 +1,8 @@
 """Tests for common.py — registry read/write with locking."""
 
+import os
 import tempfile
 import threading
-from pathlib import Path
-from unittest import mock
 
 import pytest
 
@@ -17,14 +16,14 @@ from pty_tools.common import (
 class TestRegistry:
     def setup_method(self):
         self._tmpdir = tempfile.TemporaryDirectory()
-        self._patcher_dir = mock.patch("pty_tools.common.SOCKET_DIR", Path(self._tmpdir.name))
-        self._patcher_reg = mock.patch("pty_tools.common.REGISTRY_PATH", Path(self._tmpdir.name) / "registry.json")
-        self._patcher_dir.start()
-        self._patcher_reg.start()
+        self._prev_env = os.environ.get("PTY_SOCKET_DIR")
+        os.environ["PTY_SOCKET_DIR"] = self._tmpdir.name
 
     def teardown_method(self):
-        self._patcher_dir.stop()
-        self._patcher_reg.stop()
+        if self._prev_env is None:
+            os.environ.pop("PTY_SOCKET_DIR", None)
+        else:
+            os.environ["PTY_SOCKET_DIR"] = self._prev_env
         self._tmpdir.cleanup()
 
     def test_register_and_read(self):

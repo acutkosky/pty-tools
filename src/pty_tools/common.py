@@ -7,16 +7,24 @@ import socket
 import time
 from pathlib import Path
 
-SOCKET_DIR = Path("/tmp/pty_sessions")
-REGISTRY_PATH = SOCKET_DIR / "registry.json"
+DEFAULT_SOCKET_DIR = "/tmp/pty_sessions"
+
+
+def get_socket_dir() -> Path:
+    """Resolve the socket directory from $PTY_SOCKET_DIR each call."""
+    return Path(os.environ.get("PTY_SOCKET_DIR", DEFAULT_SOCKET_DIR))
+
+
+def get_registry_path() -> Path:
+    return get_socket_dir() / "registry.json"
 
 
 def ensure_socket_dir():
-    SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+    get_socket_dir().mkdir(parents=True, exist_ok=True)
 
 
 def socket_path_for(session_id: str) -> Path:
-    return SOCKET_DIR / f"session_{session_id}.sock"
+    return get_socket_dir() / f"session_{session_id}.sock"
 
 
 # ── Registry (flock-protected JSON file) ──────────────────────────────
@@ -39,9 +47,10 @@ def _write_registry_unlocked(f, registry: dict):
 
 def read_registry() -> dict:
     ensure_socket_dir()
-    if not REGISTRY_PATH.exists():
+    registry_path = get_registry_path()
+    if not registry_path.exists():
         return {}
-    with open(REGISTRY_PATH, "r") as f:
+    with open(registry_path, "r") as f:
         fcntl.flock(f, fcntl.LOCK_SH)
         try:
             return _read_registry_unlocked(f)
@@ -52,7 +61,7 @@ def read_registry() -> dict:
 def update_registry(func):
     """Call func(registry_dict) under an exclusive flock, then write back."""
     ensure_socket_dir()
-    with open(REGISTRY_PATH, "a+") as f:
+    with open(get_registry_path(), "a+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             registry = _read_registry_unlocked(f)

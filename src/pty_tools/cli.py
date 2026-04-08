@@ -205,6 +205,9 @@ def _add_read_args(parser):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pty", description="PTY session management")
+    parser.add_argument("--socket-dir", dest="socket_dir", default=None,
+                        help="Directory for session sockets and registry "
+                             "(default: $PTY_SOCKET_DIR or /tmp/pty_sessions)")
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     # spawn
@@ -285,6 +288,8 @@ def main(argv=None):
     p.set_defaults(func=cmd_exit)
 
     args = parser.parse_args(argv)
+    if args.socket_dir is not None:
+        os.environ["PTY_SOCKET_DIR"] = args.socket_dir
     args.func(args)
 
 
