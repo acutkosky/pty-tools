@@ -224,12 +224,16 @@ class PTYServer:
                 response = self._do_write(msg)
             elif msg_type == "read":
                 response = await self._do_read(msg)
+                if self.exited and not self.read_buffer and not msg.get("peek", False):
+                    shutdown_after = True
             elif msg_type == "interact":
                 write_result = self._do_write(msg)
                 if write_result.get("status") == "error":
                     response = write_result
                 else:
                     response = await self._do_read(msg)
+                    if self.exited and not self.read_buffer and not msg.get("peek", False):
+                        shutdown_after = True
             elif msg_type == "tap":
                 response = self._do_tap(msg)
             elif msg_type == "untap":
