@@ -61,7 +61,7 @@ class PTYServer:
         self.time_limit = time_limit
 
         self._master_fd: int | None = None
-        self._proc: subprocess.Popen | None = None
+        self._proc: asyncio.subprocess.Process | None = None
         self.exited = False
         self.exit_code = None
         self.exit_signal = None
@@ -70,6 +70,7 @@ class PTYServer:
         self.read_buffer = bytearray()
         self._server: asyncio.Server | None = None
         self._new_data = asyncio.Event()
+        self._stopped = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutting_down = False
         # One asyncio task per tap target, each fed by its own queue.
@@ -83,10 +84,10 @@ class PTYServer:
         self._loop = asyncio.get_running_loop()
 
         master_fd, slave_fd = _open_pty(self.rows, self.cols)
-        self._proc = subprocess.Popen(
-            shlex.split(self.command),
+        self._proc = await asyncio.create_subprocess_exec(
+            *shlex.split(self.command),
             stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-            close_fds=True, start_new_session=True,
+            start_new_session=True,
         )
         os.close(slave_fd)
         self._master_fd = master_fd
@@ -95,6 +96,10 @@ class PTYServer:
         self._server = await asyncio.start_unix_server(
             self._handle_client, path=self.sock_path
         )
+
+        def _request_shutdown():
+            asyncio.create_task(self._shutdown())
+
         # Signal handlers only work on the main thread
         try:
             if self.foreground:
@@ -102,29 +107,33 @@ class PTYServer:
                 for sig in (signal.SIGTERM, signal.SIGHUP):
                     self._loop.add_signal_handler(sig, self._on_forward_signal, sig)
                 # SIGINT: just shutdown (don't forward — child gets it from the terminal)
-                self._loop.add_signal_handler(
-                    signal.SIGINT, lambda: asyncio.create_task(self._shutdown()))
+                self._loop.add_signal_handler(signal.SIGINT, _request_shutdown)
                 # SIGWINCH: propagate terminal size changes to child
                 self._loop.add_signal_handler(signal.SIGWINCH, self._on_sigwinch)
             else:
-                # Background: SIGTERM/SIGINT → shutdown
                 for sig in (signal.SIGTERM, signal.SIGINT):
-                    self._loop.add_signal_handler(
-                        sig, lambda: asyncio.create_task(self._shutdown()))
+                    self._loop.add_signal_handler(sig, _request_shutdown)
         except RuntimeError:
             pass
 
-        # Schedule time limit if set
         if self.time_limit is not None:
             self._loop.call_later(self.time_limit, self._on_time_limit)
 
         # Drive PTY reads off the event loop — no background thread needed.
         self._loop.add_reader(master_fd, self._on_readable)
 
-        # Start stdin forwarder if foreground (stdin is inherently blocking,
-        # so this stays in a thread and dispatches into the loop).
+        # Reap the child when it exits, record status, and wake readers.
+        asyncio.create_task(self._on_child_exit())
+
+        # Foreground stdin is inherently blocking, so it stays in a thread
+        # and dispatches writes into the loop.
         if self.foreground:
             threading.Thread(target=self._stdin_loop, daemon=True).start()
+
+    async def serve(self):
+        """Run start() and block until shutdown completes."""
+        await self.start()
+        await self._stopped.wait()
 
     def _on_readable(self):
         """Called by asyncio when the PTY master fd has data to read."""
@@ -136,32 +145,23 @@ class PTYServer:
         except BlockingIOError:
             return
         except OSError:
-            # EIO typically means the slave side closed (child exited)
+            # EIO typically means the slave side closed (child exited).
             raw = b""
         if not raw:
-            # Stop reading and collect exit status asynchronously.
             try:
                 self._loop.remove_reader(fd)
             except (ValueError, OSError):
                 pass
-            asyncio.create_task(self._on_child_exit())
             return
         self._on_data(raw)
 
     async def _on_child_exit(self):
-        """Reap the child and record its exit status, then wake readers."""
-        def _wait():
-            try:
-                return self._proc.wait(timeout=5.0)
-            except Exception:
-                return None
-
-        rc = await self._loop.run_in_executor(None, _wait)
-        if rc is not None:
-            if rc >= 0:
-                self.exit_code = rc
-            else:
-                self.exit_signal = -rc
+        """Wait for the child process to exit, then record status and wake readers."""
+        rc = await self._proc.wait()
+        if rc >= 0:
+            self.exit_code = rc
+        else:
+            self.exit_signal = -rc
         self.exited = True
         self._new_data.set()
         if self.foreground:
@@ -170,7 +170,7 @@ class PTYServer:
     def _stdin_loop(self):
         """Background thread: reads stdin line-by-line, forwards to PTY.
 
-        Writes go through the asyncio loop so they share write_lock with
+        Dispatches writes through the event loop so they share write_lock with
         socket-originated writes — otherwise a large stdin line could
         interleave with a concurrent write.
         """
@@ -178,25 +178,15 @@ class PTYServer:
             for line in sys.stdin:
                 if self.exited or self._loop is None:
                     break
-                data = line.encode("utf-8")
                 try:
                     fut = asyncio.run_coroutine_threadsafe(
-                        self._locked_write(data), self._loop
+                        self._do_write({"text": line}), self._loop
                     )
                     fut.result(timeout=30.0)
                 except Exception:
                     break
         except (EOFError, OSError):
             pass
-
-    async def _locked_write(self, data: bytes):
-        if self.exited:
-            return
-        async with self.write_lock:
-            try:
-                await self._write_bytes(data)
-            except OSError:
-                pass
 
     def _on_data(self, raw: bytes):
         """Called on the event loop when PTY produces output."""
@@ -239,34 +229,7 @@ class PTYServer:
         try:
             data = await asyncio.wait_for(reader.read(), timeout=5.0)
             msg = json.loads(data.decode())
-            msg_type = msg.get("type")
-
-            if msg_type == "write":
-                response = await self._do_write(msg)
-            elif msg_type == "read":
-                response = await self._do_read(msg)
-                if self.exited and not self.read_buffer and not msg.get("peek", False):
-                    shutdown_after = True
-            elif msg_type == "interact":
-                response = await self._do_interact(msg)
-                if self.exited and not self.read_buffer and not msg.get("peek", False):
-                    shutdown_after = True
-            elif msg_type == "tap":
-                response = self._do_tap(msg)
-            elif msg_type == "untap":
-                response = self._do_untap(msg)
-            elif msg_type == "screen":
-                response = self._do_screen()
-            elif msg_type == "resize":
-                response = self._do_resize(msg)
-            elif msg_type == "signal":
-                response = self._do_signal(msg)
-            elif msg_type == "exit":
-                response = {"status": "ok", "message": "Shutting down"}
-                shutdown_after = True
-            else:
-                response = {"status": "error", "error": f"Unknown message type: {msg_type}"}
-
+            response, shutdown_after = await self._dispatch(msg)
             writer.write(json.dumps(response).encode())
             await writer.drain()
         except Exception as e:
@@ -284,7 +247,36 @@ class PTYServer:
             if shutdown_after:
                 await self._shutdown()
 
-    def _do_tap(self, msg: dict) -> dict:
+    async def _dispatch(self, msg: dict):
+        """Route msg to its handler. Returns (response, shutdown_after)."""
+        mtype = msg.get("type")
+        if mtype == "exit":
+            return {"status": "ok", "message": "Shutting down"}, True
+        handlers = {
+            "write": self._do_write,
+            "read": self._do_read,
+            "interact": self._do_interact,
+            "tap": self._do_tap,
+            "untap": self._do_untap,
+            "screen": self._do_screen,
+            "resize": self._do_resize,
+            "signal": self._do_signal,
+        }
+        handler = handlers.get(mtype)
+        if handler is None:
+            return {"status": "error", "error": f"Unknown message type: {mtype}"}, False
+        response = await handler(msg)
+        # After a consuming read drains the buffer of an exited session, no one
+        # can reconnect usefully — shut down and clean up.
+        shutdown = (
+            mtype in ("read", "interact")
+            and self.exited
+            and not self.read_buffer
+            and not msg.get("peek", False)
+        )
+        return response, shutdown
+
+    async def _do_tap(self, msg: dict) -> dict:
         target_id = msg.get("target")
         if not target_id:
             return {"status": "error", "error": "Missing 'target' session ID"}
@@ -296,7 +288,7 @@ class PTYServer:
             self._tap_senders[target_id] = (q, task)
         return {"status": "ok", "message": f"Tapping output to '{target_id}'"}
 
-    def _do_untap(self, msg: dict) -> dict:
+    async def _do_untap(self, msg: dict) -> dict:
         target_id = msg.get("target")
         if not target_id:
             return {"status": "error", "error": "Missing 'target' session ID"}
@@ -339,28 +331,31 @@ class PTYServer:
                 raise OSError("short write returned 0")
             remaining = remaining[n:]
 
+    async def _write_under_lock(self, text) -> str | None:
+        """Caller must hold write_lock. Returns None on success or error string."""
+        data = text.encode("utf-8") if isinstance(text, str) else text
+        try:
+            await self._write_bytes(data)
+            return None
+        except OSError as e:
+            return str(e)
+
     async def _do_write(self, msg: dict) -> dict:
         if self.exited:
             return {"status": "error", "error": "Session has exited"}
-        text = msg.get("text", "")
-        data = text.encode("utf-8") if isinstance(text, str) else text
         async with self.write_lock:
-            try:
-                await self._write_bytes(data)
-            except OSError as e:
-                return {"status": "error", "error": str(e)}
-        return {"status": "ok"}
+            err = await self._write_under_lock(msg.get("text", ""))
+        return {"status": "error", "error": err} if err else {"status": "ok"}
 
     async def _do_interact(self, msg: dict) -> dict:
         if self.exited:
             return {"status": "error", "error": "Session has exited"}
-        text = msg.get("text", "")
-        data = text.encode("utf-8") if isinstance(text, str) else text
+        # Hold write_lock across write+read so no other writer can interleave
+        # between our write and the response we collect for it.
         async with self.write_lock:
-            try:
-                await self._write_bytes(data)
-            except OSError as e:
-                return {"status": "error", "error": str(e)}
+            err = await self._write_under_lock(msg.get("text", ""))
+            if err:
+                return {"status": "error", "error": err}
             return await self._do_read(msg)
 
     async def _do_read(self, msg: dict) -> dict:
@@ -393,10 +388,7 @@ class PTYServer:
                 if remaining <= 0:
                     break
 
-                if got_output:
-                    wait_time = min(stable_timeout, remaining)
-                else:
-                    wait_time = remaining
+                wait_time = min(stable_timeout, remaining) if got_output else remaining
 
                 # Wait for the background reader to deliver new data
                 self._new_data.clear()
@@ -414,11 +406,7 @@ class PTYServer:
                 elif got_output:
                     break
 
-            # Build result
-            result = {
-                "status": "ok",
-                "exited": self.exited,
-            }
+            result = {"status": "ok", "exited": self.exited}
             if self.exited:
                 result["exit_code"] = self.exit_code
                 result["signal"] = self.exit_signal
@@ -441,7 +429,7 @@ class PTYServer:
 
     def _on_forward_signal(self, sig):
         """Forward a signal to the child process group, then shut down."""
-        if self._proc and self._proc.poll() is None:
+        if self._proc and self._proc.returncode is None:
             try:
                 os.killpg(os.getpgid(self._proc.pid), sig)
             except (ProcessLookupError, PermissionError, OSError):
@@ -451,9 +439,9 @@ class PTYServer:
     def _on_sigwinch(self):
         """Handle SIGWINCH in foreground mode — propagate terminal size to child."""
         size = shutil.get_terminal_size()
-        self._do_resize({"rows": size.lines, "cols": size.columns})
+        asyncio.create_task(self._do_resize({"rows": size.lines, "cols": size.columns}))
 
-    def _do_screen(self) -> dict:
+    async def _do_screen(self, msg: dict) -> dict:
         """Return the current virtual terminal screen contents."""
         lines = [line.rstrip() for line in self._pyte_screen.display]
         return {
@@ -463,7 +451,7 @@ class PTYServer:
             "cols": self._pyte_screen.columns,
         }
 
-    def _do_resize(self, msg: dict) -> dict:
+    async def _do_resize(self, msg: dict) -> dict:
         """Resize the PTY and update the virtual terminal."""
         rows = msg.get("rows")
         cols = msg.get("cols")
@@ -471,40 +459,31 @@ class PTYServer:
             return {"status": "error", "error": "Missing 'rows' or 'cols'"}
         self.rows = rows
         self.cols = cols
-        # Update the actual PTY size
         if self._master_fd is not None:
             winsize = struct.pack("HHHH", rows, cols, 0, 0)
             fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
-        # Signal the child process group
-        if self._proc and self._proc.poll() is None:
+        if self._proc and self._proc.returncode is None:
             try:
                 os.killpg(os.getpgid(self._proc.pid), signal.SIGWINCH)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
-        # Resize the virtual terminal
         self._pyte_screen.resize(rows, cols)
         return {"status": "ok", "rows": rows, "cols": cols}
 
-    def _do_signal(self, msg: dict) -> dict:
+    async def _do_signal(self, msg: dict) -> dict:
         """Send a signal to the child process group."""
         sig_value = msg.get("signal")
         if sig_value is None:
             return {"status": "error", "error": "Missing 'signal'"}
-        # Resolve signal name or number
-        if isinstance(sig_value, int):
-            try:
+        try:
+            if isinstance(sig_value, int):
                 sig = signal.Signals(sig_value)
-            except ValueError:
-                return {"status": "error", "error": f"Unknown signal number: {sig_value}"}
-        else:
-            sig_name = sig_value.upper()
-            if not sig_name.startswith("SIG"):
-                sig_name = "SIG" + sig_name
-            try:
-                sig = signal.Signals[sig_name]
-            except KeyError:
-                return {"status": "error", "error": f"Unknown signal: {sig_value}"}
-        if self._proc is None or self._proc.poll() is not None:
+            else:
+                name = sig_value.upper()
+                sig = signal.Signals[name if name.startswith("SIG") else "SIG" + name]
+        except (KeyError, ValueError):
+            return {"status": "error", "error": f"Unknown signal: {sig_value}"}
+        if self._proc is None or self._proc.returncode is not None:
             return {"status": "error", "error": "Session has exited"}
         try:
             os.killpg(os.getpgid(self._proc.pid), sig)
@@ -522,30 +501,28 @@ class PTYServer:
             return
         self._shutting_down = True
 
-        # Stop reading PTY output.
-        if self._master_fd is not None:
-            try:
-                self._loop.remove_reader(self._master_fd)
-            except (ValueError, OSError):
-                pass
-
         # Cancel tap senders so they don't block on pending sends.
         for _, task in self._tap_senders.values():
             task.cancel()
         self._tap_senders.clear()
 
-        if self._proc and self._proc.poll() is None:
+        if self._proc and self._proc.returncode is None:
             try:
                 self._proc.kill()
             except ProcessLookupError:
                 pass
 
         if self._master_fd is not None:
+            fd = self._master_fd
+            self._master_fd = None
             try:
-                os.close(self._master_fd)
+                self._loop.remove_reader(fd)
+            except (ValueError, OSError):
+                pass
+            try:
+                os.close(fd)
             except OSError:
                 pass
-            self._master_fd = None
 
         if self._server:
             self._server.close()
@@ -555,7 +532,7 @@ class PTYServer:
             sock.unlink()
 
         unregister_session(self.session_id)
-        asyncio.get_running_loop().stop()
+        self._stopped.set()
 
 
 def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
@@ -563,15 +540,10 @@ def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
     """Entry point for the server process. Returns the child's exit code (0 if unknown)."""
     server = PTYServer(session_id, command, rows=rows, cols=cols, foreground=foreground,
                        time_limit=time_limit)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(server.start())
     try:
-        loop.run_forever()
+        asyncio.run(server.serve())
     except Exception:
         pass
-    finally:
-        loop.close()
     if server.exit_code is not None:
         return server.exit_code
     if server.exit_signal is not None:
