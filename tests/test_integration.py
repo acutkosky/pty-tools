@@ -181,8 +181,9 @@ class TestFullLifecycle:
         assert read_result["exit_code"] == 42
         assert read_result["signal"] is None
 
-    def test_interact_on_exited_session_returns_error(self):
-        """interact should return a write error if the session has already exited."""
+    def test_interact_after_drain_auto_shuts_down(self):
+        """A drain-read after the child exits auto-shuts-down the server,
+        so subsequent requests fail to connect."""
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
 
@@ -190,26 +191,26 @@ class TestFullLifecycle:
         send_request(self.session_id, {"type": "write", "text": "exit\n"})
         time.sleep(1.0)
 
-        # Drain so the server marks exited=True
+        # Drain — the server self-destructs after responding since the child
+        # has exited and the buffer is empty.
         send_request(
             self.session_id,
             {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
             timeout=5.0,
         )
+        time.sleep(0.5)
 
-        # Now interact should report the error from the write step
-        result = send_request(
-            self.session_id,
-            {
-                "type": "interact",
-                "text": "echo should_fail\n",
-                "total_timeout": 1000,
-                "stable_timeout": 300,
-            },
-            timeout=5.0,
-        )
-        assert result["status"] == "error"
-        assert "exited" in result["error"]
+        with pytest.raises(PTYClientError):
+            send_request(
+                self.session_id,
+                {
+                    "type": "interact",
+                    "text": "echo should_fail\n",
+                    "total_timeout": 1000,
+                    "stable_timeout": 300,
+                },
+                timeout=5.0,
+            )
 
     def test_strip_ansi_default(self):
         """ANSI escapes should be stripped by default."""
@@ -1050,6 +1051,88 @@ class TestTap:
         assert result["status"] == "ok"
 
 
+class TestWriteRaceConditions:
+    """Tests for concurrent write correctness."""
+
+    def setup_method(self):
+        self.session_id = f"test_race_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_write_blocks_while_interact_is_reading(self):
+        """A concurrent write must not land in the PTY until interact's read finishes.
+
+        interact holds the write lock across its write+read. If another client
+        issues a plain write while interact is still draining output, that write
+        has to wait for the lock — otherwise it could inject bytes into the PTY
+        mid-interact and corrupt interact's view of "my command's output".
+        """
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+        time.sleep(0.3)
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+        timings: dict[str, float] = {}
+        errors: list[Exception] = []
+
+        def _slow_interact():
+            # Pattern never matches → interact reads until total_timeout (~2s).
+            try:
+                start = time.time()
+                send_request(
+                    self.session_id,
+                    {
+                        "type": "interact",
+                        "text": "echo SLOW_INTERACT_OUT\n",
+                        "total_timeout": 2000,
+                        "stable_timeout": 2000,
+                        "pattern": "NO_SUCH_PATTERN_ZZZ",
+                    },
+                    timeout=10.0,
+                )
+                timings["interact"] = time.time() - start
+            except Exception as e:
+                errors.append(e)
+
+        def _quick_write():
+            # Give interact ~0.2s head-start so it acquires the write lock first.
+            time.sleep(0.2)
+            try:
+                start = time.time()
+                send_request(
+                    self.session_id,
+                    {"type": "write", "text": "echo QUICK_WRITE\n"},
+                    timeout=10.0,
+                )
+                timings["write"] = time.time() - start
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=_slow_interact)
+        t2 = threading.Thread(target=_quick_write)
+        t1.start()
+        t2.start()
+        t1.join(timeout=15.0)
+        t2.join(timeout=15.0)
+
+        assert not errors, f"unexpected errors: {errors}"
+        assert "interact" in timings and "write" in timings
+
+        # interact holds the lock for ~2s; a correctly-serialized write should
+        # return only after interact releases the lock (~1.8s given the 0.2s delay).
+        # Without the lock, write would return almost instantly.
+        assert timings["write"] > 1.0, (
+            f"write completed in {timings['write']:.2f}s — "
+            f"expected it to block until interact released the write lock "
+            f"(interact took {timings['interact']:.2f}s)"
+        )
+
+
 class TestTimeLimit:
     """Tests for the time_limit feature — automatic process termination."""
 
@@ -1343,7 +1426,9 @@ class TestSignal:
         assert result["status"] == "error"
         assert "Unknown signal" in result["error"]
 
-    def test_signal_on_exited_session(self):
+    def test_signal_after_drain_auto_shuts_down(self):
+        """A drain-read after the child exits auto-shuts-down the server,
+        so a subsequent signal request fails to connect."""
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
 
@@ -1355,11 +1440,11 @@ class TestSignal:
             {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
             timeout=5.0,
         )
+        time.sleep(0.5)
 
-        result = send_request(
-            self.session_id,
-            {"type": "signal", "signal": "TERM"},
-            timeout=5.0,
-        )
-        assert result["status"] == "error"
-        assert "exited" in result["error"]
+        with pytest.raises(PTYClientError):
+            send_request(
+                self.session_id,
+                {"type": "signal", "signal": "TERM"},
+                timeout=5.0,
+            )

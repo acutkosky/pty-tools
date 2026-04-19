@@ -5,10 +5,8 @@ import asyncio
 import fcntl
 import json
 import os
-import queue
 import pty as pty_mod
 import re
-import select
 import shlex
 import shutil
 import signal
@@ -23,10 +21,9 @@ import time
 import pyte
 
 from pty_tools.common import (
-    PTYClientError,
     is_server_alive,
     register_session,
-    send_request,
+    send_request_async,
     socket_path_for,
     unregister_session,
 )
@@ -41,6 +38,10 @@ def _open_pty(rows: int, cols: int):
     settings = termios.tcgetattr(master_fd)
     settings[3] = settings[3] & ~termios.ECHO
     termios.tcsetattr(master_fd, termios.TCSADRAIN, settings)
+    # Non-blocking master fd: writes go through asyncio's add_writer when the
+    # slave can't keep up, so a stalled child can't freeze the event loop.
+    fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
     winsize = struct.pack("HHHH", rows, cols, 0, 0)
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
     return master_fd, slave_fd
@@ -65,13 +66,14 @@ class PTYServer:
         self.exit_code = None
         self.exit_signal = None
         self.read_lock = asyncio.Lock()
+        self.write_lock = asyncio.Lock()
         self.read_buffer = bytearray()
         self._server: asyncio.Server | None = None
         self._new_data = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
-        self.tap_targets: set[str] = set()  # session IDs to forward output to
-        self._tap_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
-        self._tap_thread: threading.Thread | None = None
+        self._shutting_down = False
+        # One asyncio task per tap target, each fed by its own queue.
+        self._tap_senders: dict[str, tuple[asyncio.Queue, asyncio.Task]] = {}
 
         # pyte virtual terminal for screen capture
         self._pyte_screen = pyte.Screen(cols, rows)
@@ -116,101 +118,120 @@ class PTYServer:
         if self.time_limit is not None:
             self._loop.call_later(self.time_limit, self._on_time_limit)
 
-        # Start background PTY reader thread
-        threading.Thread(target=self._read_loop, daemon=True).start()
+        # Drive PTY reads off the event loop — no background thread needed.
+        self._loop.add_reader(master_fd, self._on_readable)
 
-        # Start stdin forwarder if foreground
+        # Start stdin forwarder if foreground (stdin is inherently blocking,
+        # so this stays in a thread and dispatches into the loop).
         if self.foreground:
             threading.Thread(target=self._stdin_loop, daemon=True).start()
 
-    def _read_loop(self):
-        """Background thread: continuously reads from PTY and dispatches to asyncio."""
-        while True:
-            try:
-                ready, _, _ = select.select([self._master_fd], [], [], 1.0)
-            except (ValueError, OSError):
-                # fd closed
-                break
-            if not ready:
-                continue
-            try:
-                raw = os.read(self._master_fd, 4096)
-            except OSError:
-                # EIO means the slave side closed (child exited)
-                raw = b""
-            if not raw:
-                self._collect_exit_status()
-                return
-            self._loop.call_soon_threadsafe(self._on_data, raw)
-
-    def _collect_exit_status(self):
-        """Wait for the child to finish and dispatch exit info to asyncio."""
-        exit_code = None
-        exit_signal = None
+    def _on_readable(self):
+        """Called by asyncio when the PTY master fd has data to read."""
+        fd = self._master_fd
+        if fd is None:
+            return
         try:
-            self._proc.wait(timeout=5.0)
-            rc = self._proc.returncode
+            raw = os.read(fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            # EIO typically means the slave side closed (child exited)
+            raw = b""
+        if not raw:
+            # Stop reading and collect exit status asynchronously.
+            try:
+                self._loop.remove_reader(fd)
+            except (ValueError, OSError):
+                pass
+            asyncio.create_task(self._on_child_exit())
+            return
+        self._on_data(raw)
+
+    async def _on_child_exit(self):
+        """Reap the child and record its exit status, then wake readers."""
+        def _wait():
+            try:
+                return self._proc.wait(timeout=5.0)
+            except Exception:
+                return None
+
+        rc = await self._loop.run_in_executor(None, _wait)
+        if rc is not None:
             if rc >= 0:
-                exit_code = rc
+                self.exit_code = rc
             else:
-                exit_signal = -rc
-        except Exception:
-            pass
-        self._loop.call_soon_threadsafe(self._on_eof, exit_code, exit_signal)
+                self.exit_signal = -rc
+        self.exited = True
+        self._new_data.set()
+        if self.foreground:
+            await self._shutdown()
 
     def _stdin_loop(self):
-        """Background thread: reads stdin line-by-line, forwards to PTY."""
+        """Background thread: reads stdin line-by-line, forwards to PTY.
+
+        Writes go through the asyncio loop so they share write_lock with
+        socket-originated writes — otherwise a large stdin line could
+        interleave with a concurrent write.
+        """
         try:
             for line in sys.stdin:
-                if self.exited:
+                if self.exited or self._loop is None:
                     break
-                os.write(self._master_fd, line.encode("utf-8"))
+                data = line.encode("utf-8")
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._locked_write(data), self._loop
+                    )
+                    fut.result(timeout=30.0)
+                except Exception:
+                    break
         except (EOFError, OSError):
             pass
 
+    async def _locked_write(self, data: bytes):
+        if self.exited:
+            return
+        async with self.write_lock:
+            try:
+                await self._write_bytes(data)
+            except OSError:
+                pass
+
     def _on_data(self, raw: bytes):
-        """Called on asyncio thread when PTY produces output."""
+        """Called on the event loop when PTY produces output."""
         self.read_buffer.extend(raw)
         self._pyte_stream.feed(raw.decode("utf-8", errors="replace"))
         if self.foreground:
             sys.stdout.buffer.write(raw)
             sys.stdout.buffer.flush()
-        self._forward_to_taps(raw)
+        if self._tap_senders:
+            text = raw.decode("utf-8", errors="replace")
+            for q, _ in self._tap_senders.values():
+                q.put_nowait(text)
         self._new_data.set()
 
-    def _forward_to_taps(self, raw: bytes):
-        """Forward output to all tap targets, preserving ordering."""
-        if not self.tap_targets:
-            return
-        if self._tap_thread is None or not self._tap_thread.is_alive():
-            self._tap_thread = threading.Thread(target=self._tap_worker, daemon=True)
-            self._tap_thread.start()
-        text = raw.decode("utf-8", errors="replace")
-        for target_id in list(self.tap_targets):
-            self._tap_queue.put((target_id, text))
+    async def _tap_sender(self, target_id: str, q: asyncio.Queue):
+        """Drain this target's queue, forwarding each chunk over a socket.
 
-    def _tap_worker(self):
-        """Single worker thread that drains the tap queue in order."""
-        while True:
-            item = self._tap_queue.get()
-            if item is None:
-                return
-            target_id, text = item
-            if target_id not in self.tap_targets:
-                continue
-            try:
-                send_request(target_id, {"type": "write", "text": text}, timeout=5.0)
-            except Exception:
-                self.tap_targets.discard(target_id)
-
-    def _on_eof(self, exit_code, exit_signal):
-        """Called on asyncio thread when PTY child exits."""
-        self.exited = True
-        self.exit_code = exit_code
-        self.exit_signal = exit_signal
-        self._new_data.set()
-        if self.foreground:
-            asyncio.create_task(self._shutdown())
+        One task per target means a slow target can't block delivery to others;
+        per-target FIFO is preserved because each queue has a single consumer.
+        """
+        try:
+            while True:
+                text = await q.get()
+                try:
+                    await send_request_async(
+                        target_id,
+                        {"type": "write", "text": text},
+                        timeout=5.0,
+                    )
+                except Exception:
+                    # Target unreachable — drop the tap.
+                    self._tap_senders.pop(target_id, None)
+                    return
+        except asyncio.CancelledError:
+            pass
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a single client connection."""
@@ -221,19 +242,15 @@ class PTYServer:
             msg_type = msg.get("type")
 
             if msg_type == "write":
-                response = self._do_write(msg)
+                response = await self._do_write(msg)
             elif msg_type == "read":
                 response = await self._do_read(msg)
                 if self.exited and not self.read_buffer and not msg.get("peek", False):
                     shutdown_after = True
             elif msg_type == "interact":
-                write_result = self._do_write(msg)
-                if write_result.get("status") == "error":
-                    response = write_result
-                else:
-                    response = await self._do_read(msg)
-                    if self.exited and not self.read_buffer and not msg.get("peek", False):
-                        shutdown_after = True
+                response = await self._do_interact(msg)
+                if self.exited and not self.read_buffer and not msg.get("peek", False):
+                    shutdown_after = True
             elif msg_type == "tap":
                 response = self._do_tap(msg)
             elif msg_type == "untap":
@@ -273,23 +290,78 @@ class PTYServer:
             return {"status": "error", "error": "Missing 'target' session ID"}
         if not is_server_alive(target_id):
             return {"status": "error", "error": f"Target session '{target_id}' is not running"}
-        self.tap_targets.add(target_id)
+        if target_id not in self._tap_senders:
+            q: asyncio.Queue = asyncio.Queue()
+            task = asyncio.create_task(self._tap_sender(target_id, q))
+            self._tap_senders[target_id] = (q, task)
         return {"status": "ok", "message": f"Tapping output to '{target_id}'"}
 
     def _do_untap(self, msg: dict) -> dict:
         target_id = msg.get("target")
         if not target_id:
             return {"status": "error", "error": "Missing 'target' session ID"}
-        self.tap_targets.discard(target_id)
+        entry = self._tap_senders.pop(target_id, None)
+        if entry is not None:
+            _, task = entry
+            task.cancel()
         return {"status": "ok", "message": f"Removed tap to '{target_id}'"}
 
-    def _do_write(self, msg: dict) -> dict:
-        text = msg.get("text", "")
+    async def _write_bytes(self, data: bytes):
+        """Write all bytes to the master fd, yielding on EAGAIN.
+
+        Caller must hold self.write_lock so concurrent writers can't interleave
+        or race across a partial-write boundary.
+        """
+        remaining = memoryview(data)
+        while remaining:
+            fd = self._master_fd
+            if fd is None:
+                raise OSError("PTY is closed")
+            try:
+                n = os.write(fd, remaining)
+            except BlockingIOError:
+                fut = self._loop.create_future()
+
+                def _wake():
+                    if not fut.done():
+                        fut.set_result(None)
+
+                self._loop.add_writer(fd, _wake)
+                try:
+                    await fut
+                finally:
+                    try:
+                        self._loop.remove_writer(fd)
+                    except (ValueError, OSError):
+                        pass
+                continue
+            if n <= 0:
+                raise OSError("short write returned 0")
+            remaining = remaining[n:]
+
+    async def _do_write(self, msg: dict) -> dict:
         if self.exited:
             return {"status": "error", "error": "Session has exited"}
+        text = msg.get("text", "")
         data = text.encode("utf-8") if isinstance(text, str) else text
-        os.write(self._master_fd, data)
+        async with self.write_lock:
+            try:
+                await self._write_bytes(data)
+            except OSError as e:
+                return {"status": "error", "error": str(e)}
         return {"status": "ok"}
+
+    async def _do_interact(self, msg: dict) -> dict:
+        if self.exited:
+            return {"status": "error", "error": "Session has exited"}
+        text = msg.get("text", "")
+        data = text.encode("utf-8") if isinstance(text, str) else text
+        async with self.write_lock:
+            try:
+                await self._write_bytes(data)
+            except OSError as e:
+                return {"status": "error", "error": str(e)}
+            return await self._do_read(msg)
 
     async def _do_read(self, msg: dict) -> dict:
         total_timeout = msg.get("total_timeout", 5000) / 1000.0
@@ -446,6 +518,22 @@ class PTYServer:
             asyncio.create_task(self._shutdown())
 
     async def _shutdown(self):
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
+        # Stop reading PTY output.
+        if self._master_fd is not None:
+            try:
+                self._loop.remove_reader(self._master_fd)
+            except (ValueError, OSError):
+                pass
+
+        # Cancel tap senders so they don't block on pending sends.
+        for _, task in self._tap_senders.values():
+            task.cancel()
+        self._tap_senders.clear()
+
         if self._proc and self._proc.poll() is None:
             try:
                 self._proc.kill()

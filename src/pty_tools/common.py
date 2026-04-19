@@ -1,5 +1,6 @@
 """Shared infrastructure: socket paths, registry with flock, client."""
 
+import asyncio
 import fcntl
 import json
 import os
@@ -147,3 +148,34 @@ def send_request(session_id: str, message: dict, timeout: float = 30.0) -> dict:
         return json.loads(response.decode())
     finally:
         sock.close()
+
+
+async def send_request_async(session_id: str, message: dict, timeout: float = 30.0) -> dict:
+    """Async version of send_request — for use inside the asyncio server."""
+    sock_path = str(socket_path_for(session_id))
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(sock_path), timeout=timeout
+        )
+    except (ConnectionRefusedError, FileNotFoundError):
+        if not is_server_alive(session_id):
+            raise PTYClientError(
+                f"Session '{session_id}' is not running. It may have exited. "
+                f"Use pty list to see active sessions."
+            )
+        raise PTYClientError(
+            f"Cannot connect to session '{session_id}' — connection refused."
+        )
+    try:
+        writer.write(json.dumps(message).encode())
+        if writer.can_write_eof():
+            writer.write_eof()
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), timeout=timeout)
+        return json.loads(response.decode())
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
