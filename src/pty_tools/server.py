@@ -411,10 +411,12 @@ class PTYServer:
                 result["exit_code"] = self.exit_code
                 result["signal"] = self.exit_signal
 
-            # Consume buffer (pattern match consumes up to match; otherwise all)
+            # Consume buffer (pattern match consumes up to match; otherwise all).
+            # peek=True always leaves the buffer untouched.
             if match_end is not None:
                 show = bytes(self.read_buffer[:match_end])
-                self.read_buffer = bytearray(self.read_buffer[match_end:])
+                if not peek:
+                    self.read_buffer = bytearray(self.read_buffer[match_end:])
             else:
                 show = bytes(self.read_buffer)
                 if not peek:
@@ -429,12 +431,21 @@ class PTYServer:
 
     def _on_forward_signal(self, sig):
         """Forward a signal to the child process group, then shut down."""
+        asyncio.create_task(self._forward_and_shutdown(sig))
+
+    async def _forward_and_shutdown(self, sig):
         if self._proc and self._proc.returncode is None:
             try:
                 os.killpg(os.getpgid(self._proc.pid), sig)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
-        asyncio.create_task(self._shutdown())
+            # Give the child a moment to exit from the forwarded signal before
+            # _shutdown's SIGKILL fallback — otherwise the forward is pointless.
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+        await self._shutdown()
 
     def _on_sigwinch(self):
         """Handle SIGWINCH in foreground mode — propagate terminal size to child."""

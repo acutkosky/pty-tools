@@ -78,24 +78,24 @@ class TestFullLifecycle:
         result = send_request(self.session_id, {"type": "exit"}, timeout=10.0)
         assert result["status"] == "ok"
 
-        # Give server time to clean up
-        time.sleep(1.0)
+        # Server shuts down asynchronously after sending the response; poll.
+        sock = socket_path_for(self.session_id)
+        for _ in range(40):
+            if not sock.exists():
+                break
+            time.sleep(0.05)
 
-        # Verify cleanup
-        assert not socket_path_for(self.session_id).exists()
+        assert not sock.exists()
         assert not is_server_alive(self.session_id)
 
     def test_write_then_read(self):
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
 
-        # Give the shell time to start
-        time.sleep(0.5)
-
-        # Read initial prompt/output
+        # Drain initial prompt (read waits for it via stable_timeout)
         send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
             timeout=5.0,
         )
 
@@ -117,10 +117,9 @@ class TestFullLifecycle:
         assert result["status"] == "ok"
 
         # Drain initial output
-        time.sleep(0.3)
         send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
             timeout=5.0,
         )
 
@@ -167,13 +166,13 @@ class TestFullLifecycle:
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
 
-        # Tell the shell to exit with a specific code
+        # Tell the shell to exit with a specific code; the read below breaks
+        # out on self.exited, so no sleep is needed — it waits for the exit.
         send_request(self.session_id, {"type": "write", "text": "exit 42\n"})
-        time.sleep(1.0)
 
         read_result = send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 2000, "stable_timeout": 500},
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
             timeout=10.0,
         )
         assert read_result["status"] == "ok"
@@ -187,17 +186,17 @@ class TestFullLifecycle:
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
 
-        # Tell the shell to exit and wait for it
         send_request(self.session_id, {"type": "write", "text": "exit\n"})
-        time.sleep(1.0)
 
-        # Drain — the server self-destructs after responding since the child
-        # has exited and the buffer is empty.
+        # Drain — the read waits for exited=True (via _new_data), then the
+        # server self-destructs after responding since the buffer is empty.
         send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 300},
             timeout=5.0,
         )
+        # Let the server's post-response _shutdown finish before asserting
+        # the connection fails.
         time.sleep(0.5)
 
         with pytest.raises(PTYClientError):
@@ -280,10 +279,9 @@ class TestNoEcho:
     def _spawn_and_drain(self):
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
-        time.sleep(0.5)
         send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
             timeout=5.0,
         )
 
@@ -295,13 +293,14 @@ class TestNoEcho:
         """
         self._spawn_and_drain()
 
-        # Variable assignment produces no shell output
+        # Variable assignment produces no shell output; the read below waits
+        # for any output (up to total_timeout) and then stable_timeout after
+        # each chunk, so no pre-sleep is needed.
         send_request(self.session_id, {"type": "write", "text": "NOECHO_VAR_X9Z=1\n"})
-        time.sleep(0.5)
 
         read_result = send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 1500, "stable_timeout": 500},
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 500},
             timeout=10.0,
         )
         assert read_result["status"] == "ok"
@@ -361,11 +360,10 @@ class TestPeek:
     def _spawn(self):
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
-        # Drain initial output
-        time.sleep(0.3)
+        # Drain initial output (read waits for prompt via stable_timeout)
         send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
             timeout=5.0,
         )
 
@@ -443,9 +441,8 @@ class TestPeek:
         self._spawn()
 
         send_request(self.session_id, {"type": "write", "text": "echo MARKER\n"})
-        time.sleep(0.3)
 
-        # Peek (no pattern) — buffer the output
+        # Peek (no pattern) — buffer the output. total_timeout waits for data.
         peek = send_request(
             self.session_id,
             {"type": "read", "total_timeout": 2000, "stable_timeout": 500, "peek": True},
@@ -476,9 +473,8 @@ class TestPeek:
 
         send_request(self.session_id, {"type": "write", "text": "cat\n"})
         send_request(self.session_id, {"type": "write", "text": "MAR\n"})
-        time.sleep(0.3)
 
-        # Peek — buffers "MAR"
+        # Peek — buffers "MAR" (read waits up to total_timeout for data)
         peek = send_request(
             self.session_id,
             {"type": "read", "total_timeout": 2000, "stable_timeout": 500, "peek": True},
@@ -693,12 +689,11 @@ class TestForeground:
         """Foreground server should forward stdin lines to the PTY."""
         proc, _ = self._spawn_foreground(stdin_lines=["echo stdin_fwd_test"])
 
-        # Give the command time to execute
-        time.sleep(0.5)
-
+        # The read waits up to total_timeout for the output to arrive.
         result = send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            {"type": "read", "pattern": "stdin_fwd_test",
+             "total_timeout": 3000, "stable_timeout": 500},
             timeout=10.0,
         )
         assert result["status"] == "ok"
@@ -806,6 +801,40 @@ class TestForeground:
 
         send_request(self.session_id, {"type": "exit"}, timeout=10.0)
 
+    def test_foreground_sigterm_shuts_down_server(self):
+        """SIGTERM to a foreground server triggers shutdown and cleanup."""
+        proc, _ = self._spawn_foreground(command="sleep 30")
+        # Give the server time to finish installing signal handlers.
+        time.sleep(0.3)
+
+        os.kill(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10.0)
+
+        assert proc.returncode is not None
+        assert not socket_path_for(self.session_id).exists()
+        assert not is_server_alive(self.session_id)
+
+    def test_foreground_sigterm_forwards_to_child(self):
+        """SIGTERM to the foreground server is forwarded to the child.
+
+        The child installs a trap that exits cleanly with status 0 on SIGTERM.
+        If forwarding works, the child exits via the trap → proc.returncode=0.
+        Without forwarding, the server's SIGKILL fallback would yield 137
+        (128+SIGKILL).
+        """
+        cmd = "sh -c 'trap \"exit 0\" TERM; sleep 30'"
+        proc, _ = self._spawn_foreground(command=cmd)
+        # Give the child shell time to install the trap.
+        time.sleep(0.5)
+
+        os.kill(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10.0)
+
+        assert proc.returncode == 0, (
+            f"server returncode={proc.returncode}; expected 0 (child trap ran). "
+            f"137 would indicate SIGKILL fallback (forwarding didn't complete)."
+        )
+
 
 class TestTap:
     """Tests for tap/untap — forwarding output between sessions."""
@@ -823,11 +852,10 @@ class TestTap:
     def _spawn(self, session_id):
         result = daemonize_server(session_id, "sh")
         assert result["status"] == "ok"
-        time.sleep(0.3)
-        # Drain initial output
+        # Drain initial output (read waits for prompt via stable_timeout)
         send_request(
             session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
             timeout=5.0,
         )
 
@@ -852,13 +880,11 @@ class TestTap:
             timeout=10.0,
         )
 
-        # Give tap time to forward
-        time.sleep(1.0)
-
-        # Read from dst — should see the forwarded output
+        # Read from dst — pattern match returns as soon as the tap forwards.
         dst_result = send_request(
             self.dst_id,
-            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            {"type": "read", "pattern": "tap_fwd_test",
+             "total_timeout": 3000, "stable_timeout": 500},
             timeout=10.0,
         )
         assert dst_result["status"] == "ok"
@@ -886,9 +912,8 @@ class TestTap:
             timeout=10.0,
         )
 
-        time.sleep(1.0)
-
-        # dst should have no new output (just timeout with empty response)
+        # Negative assertion: the dst read waits 1s — if tap were still
+        # active, data would arrive in that window.
         dst_result = send_request(
             self.dst_id,
             {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
@@ -940,17 +965,18 @@ class TestTap:
             timeout=10.0,
         )
 
-        time.sleep(1.0)
-
-        # Both dst and dst2 should have the output
+        # Both dst and dst2 should have the output — pattern match returns
+        # as soon as the tap forwards.
         dst_result = send_request(
             self.dst_id,
-            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            {"type": "read", "pattern": "multi_tap_test",
+             "total_timeout": 3000, "stable_timeout": 500},
             timeout=10.0,
         )
         dst2_result = send_request(
             self.dst2_id,
-            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            {"type": "read", "pattern": "multi_tap_test",
+             "total_timeout": 3000, "stable_timeout": 500},
             timeout=10.0,
         )
         assert "multi_tap_test" in dst_result["response"]
@@ -980,9 +1006,7 @@ class TestTap:
             timeout=10.0,
         )
 
-        time.sleep(1.0)
-
-        # dst should NOT have the output
+        # dst should NOT have the output (1s wait gives it a chance to appear)
         dst_result = send_request(
             self.dst_id,
             {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
@@ -990,10 +1014,11 @@ class TestTap:
         )
         assert "partial_untap" not in dst_result["response"]
 
-        # dst2 should still have it
+        # dst2 should still have it — pattern match returns when forwarded
         dst2_result = send_request(
             self.dst2_id,
-            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            {"type": "read", "pattern": "partial_untap",
+             "total_timeout": 3000, "stable_timeout": 500},
             timeout=10.0,
         )
         assert "partial_untap" in dst2_result["response"]
@@ -1005,9 +1030,9 @@ class TestTap:
 
         send_request(self.src_id, {"type": "tap", "target": self.dst_id})
 
-        # Kill dst
+        # Kill dst (server shuts down async; subsequent src tap_senders will
+        # fail to connect, triggering the auto-cleanup path).
         send_request(self.dst_id, {"type": "exit"}, timeout=10.0)
-        time.sleep(1.0)
 
         # Generate output on src — the tap send should fail and auto-remove
         send_request(
@@ -1070,10 +1095,9 @@ class TestWriteRaceConditions:
         """
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
-        time.sleep(0.3)
         send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
             timeout=5.0,
         )
 
@@ -1131,6 +1155,55 @@ class TestWriteRaceConditions:
             f"expected it to block until interact released the write lock "
             f"(interact took {timings['interact']:.2f}s)"
         )
+
+    def test_concurrent_writes_do_not_corrupt(self):
+        """Concurrent writes from multiple clients must not corrupt each other.
+
+        Each writer sends many copies of a distinctive marker. If write_lock
+        didn't serialize whole payloads, a partial-write interleaving could
+        split a marker across writers and break it. We verify each marker
+        appears exactly the expected number of times in the echoed output.
+        """
+        # cat echoes stdin back via the PTY — a convenient way to observe
+        # what actually hit the PTY in what order.
+        result = daemonize_server(self.session_id, "cat")
+        assert result["status"] == "ok"
+
+        num_writers = 4
+        marker_repeats = 30
+
+        def _writer(idx):
+            marker = f"MARK_{idx}_END\n"
+            # One large payload per writer — the full payload must land
+            # atomically with respect to other writers.
+            send_request(
+                self.session_id,
+                {"type": "write", "text": marker * marker_repeats},
+                timeout=15.0,
+            )
+
+        threads = [threading.Thread(target=_writer, args=(i,)) for i in range(num_writers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30.0)
+
+        # Collect the echoed output — wait long enough for all writers' data
+        # to be processed and echoed back.
+        result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 5000, "stable_timeout": 1000},
+            timeout=15.0,
+        )
+        assert result["status"] == "ok"
+
+        for idx in range(num_writers):
+            marker = f"MARK_{idx}_END"
+            count = result["response"].count(marker)
+            assert count == marker_repeats, (
+                f"Writer {idx}: expected {marker_repeats} copies of {marker!r}, "
+                f"got {count} — writes corrupted each other."
+            )
 
 
 class TestTimeLimit:
@@ -1268,16 +1341,24 @@ class TestScreen:
     def test_screen_does_not_consume_read_buffer(self):
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
-        time.sleep(0.3)
         # Drain initial output
         send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
             timeout=5.0,
         )
 
         send_request(self.session_id, {"type": "write", "text": "echo buffer_check\n"})
-        time.sleep(0.5)
+        # Wait (without consuming) for the output to land in the buffer; this
+        # is what replaces a sleep — we can't snapshot the screen before the
+        # PTY data has been processed.
+        peek = send_request(
+            self.session_id,
+            {"type": "read", "peek": True, "pattern": "buffer_check",
+             "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert "buffer_check" in peek["response"]
 
         # Screen read should not consume the buffer
         send_request(self.session_id, {"type": "screen"}, timeout=5.0)
@@ -1381,11 +1462,10 @@ class TestSignal:
         assert result["status"] == "ok"
         assert result["signal"] == "SIGKILL"
 
-        # Child should exit
-        time.sleep(1.0)
+        # Child should exit — the read waits for self.exited via _new_data.
         read_result = send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 2000, "stable_timeout": 500},
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
             timeout=10.0,
         )
         assert read_result["exited"] is True
@@ -1432,14 +1512,16 @@ class TestSignal:
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
 
-        # Exit the shell first
+        # Exit the shell; the drain-read below waits for exited=True via
+        # _new_data, then auto-shuts-down after draining the empty buffer.
         send_request(self.session_id, {"type": "write", "text": "exit\n"})
-        time.sleep(1.0)
         send_request(
             self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 300},
             timeout=5.0,
         )
+        # Let the server's post-response _shutdown finish before asserting
+        # the signal connection fails.
         time.sleep(0.5)
 
         with pytest.raises(PTYClientError):
@@ -1448,3 +1530,87 @@ class TestSignal:
                 {"type": "signal", "signal": "TERM"},
                 timeout=5.0,
             )
+
+
+class TestErrorPaths:
+    """Tests for error responses from the server's dispatch handlers."""
+
+    def setup_method(self):
+        self.session_id = f"test_err_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_signal_on_exited_child(self):
+        """Signal on a session whose child has exited should return an error.
+
+        The server stays up (no drain-read yet), so the request reaches it;
+        _do_signal checks returncode and rejects.
+        """
+        result = daemonize_server(self.session_id, "sh -c 'exit 0'")
+        assert result["status"] == "ok"
+
+        # Wait for the child to exit without draining, via a peek read.
+        peek = send_request(
+            self.session_id,
+            {"type": "read", "peek": True, "total_timeout": 3000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+        assert peek["exited"] is True
+
+        result = send_request(
+            self.session_id,
+            {"type": "signal", "signal": "TERM"},
+            timeout=5.0,
+        )
+        assert result["status"] == "error"
+        assert "exited" in result["error"].lower()
+
+    def test_resize_missing_rows(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {"type": "resize", "cols": 80},
+            timeout=5.0,
+        )
+        assert result["status"] == "error"
+        assert "rows" in result["error"]
+
+    def test_unknown_message_type(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {"type": "bogus_type_xyz"},
+            timeout=5.0,
+        )
+        assert result["status"] == "error"
+        assert "Unknown" in result["error"]
+
+    def test_malformed_json_request(self):
+        """Non-JSON payload should trigger the generic exception handler."""
+        import socket as _socket
+
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        try:
+            sock.connect(str(socket_path_for(self.session_id)))
+            sock.sendall(b"this is not valid json at all")
+            sock.shutdown(_socket.SHUT_WR)
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        finally:
+            sock.close()
+
+        result = json.loads(response.decode())
+        assert result["status"] == "error"
