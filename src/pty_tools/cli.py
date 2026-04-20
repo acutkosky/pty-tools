@@ -218,14 +218,22 @@ def _add_read_args(parser):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="pty", description="PTY session management")
-    parser.add_argument("--socket-dir", dest="socket_dir", default=None,
+    # Shared across the main parser and every subparser so --socket-dir works
+    # in either position: `pty --socket-dir X spawn ...` or
+    # `pty spawn --socket-dir X ...`. SUPPRESS keeps the subparser from
+    # overwriting a value set at the main parser when no flag is given.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--socket-dir", dest="socket_dir",
+                        default=argparse.SUPPRESS,
                         help="Directory for session sockets and registry "
                              "(default: $PTY_SOCKET_DIR or /tmp/pty_sessions)")
+
+    parser = argparse.ArgumentParser(prog="pty", description="PTY session management",
+                                      parents=[common])
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     # spawn
-    p = sub.add_parser("spawn", help="Spawn a new PTY session",
+    p = sub.add_parser("spawn", parents=[common], help="Spawn a new PTY session",
                         description="Spawn a process in a new PTY session. Runs in foreground by default (stdin forwarded, PTY output streamed to stdout). Use --detach to daemonize.")
     p.add_argument("id", help="Session identifier")
     p.add_argument("cmd", nargs=argparse.REMAINDER,
@@ -244,7 +252,7 @@ def main(argv=None):
     p.set_defaults(func=cmd_spawn)
 
     # write
-    p = sub.add_parser("write", help="Send input to PTY session(s)",
+    p = sub.add_parser("write", parents=[common], help="Send input to PTY session(s)",
                         description="Send input to one or more PTY sessions. Reads from stdin by default, or use --input for a literal string. Use --stream to send stdin line by line.")
     p.add_argument("id", nargs="+", help="Session identifier(s)")
     p.add_argument("--input", dest="input_text", help="Text to send (default: read from stdin)")
@@ -252,7 +260,7 @@ def main(argv=None):
     p.set_defaults(func=cmd_write)
 
     # read
-    p = sub.add_parser("read", help="Read output from a PTY session",
+    p = sub.add_parser("read", parents=[common], help="Read output from a PTY session",
                         description="Read output from a PTY session. Consumes the read buffer by default (use --peek to preserve it). Use --screen for a virtual terminal snapshot instead of the raw buffer.")
     p.add_argument("id", help="Session identifier")
     p.add_argument("--screen", action="store_true", help="Return virtual terminal screen snapshot")
@@ -260,7 +268,7 @@ def main(argv=None):
     p.set_defaults(func=cmd_read)
 
     # interact
-    p = sub.add_parser("interact", help="Atomic write-then-read",
+    p = sub.add_parser("interact", parents=[common], help="Atomic write-then-read",
                         description="Atomic write-then-read. Sends input and reads the response in a single operation, avoiding race conditions between separate write and read calls.")
     p.add_argument("id", help="Session identifier")
     p.add_argument("--input", dest="input_text", required=True, help="Text to send")
@@ -268,7 +276,7 @@ def main(argv=None):
     p.set_defaults(func=cmd_interact)
 
     # resize
-    p = sub.add_parser("resize", help="Resize a PTY session",
+    p = sub.add_parser("resize", parents=[common], help="Resize a PTY session",
                         description="Resize the PTY terminal. Updates the terminal size, sends SIGWINCH to the child process group, and resizes the virtual terminal screen.")
     p.add_argument("id", help="Session identifier")
     p.add_argument("--rows", type=int, required=True, help="New row count")
@@ -276,33 +284,33 @@ def main(argv=None):
     p.set_defaults(func=cmd_resize)
 
     # signal
-    p = sub.add_parser("signal", help="Send a signal to a PTY session",
+    p = sub.add_parser("signal", parents=[common], help="Send a signal to a PTY session",
                         description="Send a signal to the child process group. Accepts signal names (SIGTERM, TERM) or numbers (15).")
     p.add_argument("id", help="Session identifier")
     p.add_argument("signal", help="Signal name (e.g. SIGTERM, TERM) or number")
     p.set_defaults(func=cmd_signal)
 
     # tap
-    p = sub.add_parser("tap", help="Forward output of one session to input of another",
+    p = sub.add_parser("tap", parents=[common], help="Forward output of one session to input of another",
                         description="Forward all output from one session to the stdin of another. Multiple taps from the same source are supported. Auto-removed if the target exits.")
     p.add_argument("out_id", help="Source session (whose output to forward)")
     p.add_argument("in_id", help="Target session (whose stdin receives the output)")
     p.set_defaults(func=cmd_tap)
 
     # untap
-    p = sub.add_parser("untap", help="Remove a tap",
+    p = sub.add_parser("untap", parents=[common], help="Remove a tap",
                         description="Remove a previously established tap. Untapping a target that was never tapped is a no-op.")
     p.add_argument("out_id", help="Source session")
     p.add_argument("in_id", help="Target session")
     p.set_defaults(func=cmd_untap)
 
     # list
-    p = sub.add_parser("list", help="List active sessions",
+    p = sub.add_parser("list", parents=[common], help="List active sessions",
                         description="List active sessions as a JSON array. Stale entries (dead server processes) are cleaned up automatically.")
     p.set_defaults(func=cmd_list)
 
     # exit
-    p = sub.add_parser("exit", help="Terminate a session",
+    p = sub.add_parser("exit", parents=[common], help="Terminate a session",
                         description="Terminate a session. If the server is unresponsive, force-kills the process and cleans up the socket and registry. With --drain, returns any remaining PTY output and the child's exit status before shutting down.")
     p.add_argument("id", help="Session identifier")
     p.add_argument("--drain", action="store_true",
@@ -313,8 +321,9 @@ def main(argv=None):
     p.set_defaults(func=cmd_exit)
 
     args = parser.parse_args(argv)
-    if args.socket_dir is not None:
-        os.environ["PTY_SOCKET_DIR"] = args.socket_dir
+    socket_dir = getattr(args, "socket_dir", None)
+    if socket_dir is not None:
+        os.environ["PTY_SOCKET_DIR"] = socket_dir
     args.func(args)
 
 

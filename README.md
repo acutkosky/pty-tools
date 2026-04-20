@@ -258,7 +258,7 @@ Taps are implemented as a set of target session IDs on the server. When new outp
 
 Reads are serialized (one at a time) via an async lock. The read waits on an event that the background reader signals whenever new data arrives, implementing the timeout and pattern-matching logic reactively.
 
-A shared registry at `<socket_dir>/registry.json` (protected by `flock`) tracks active sessions. The socket directory can be configured via the `PTY_SOCKET_DIR` environment variable or the top-level `pty --socket-dir <path>` flag; both client and server invocations must agree on the value (the `--socket-dir` flag sets the env var so that daemonized servers inherit it).
+A shared registry at `<socket_dir>/registry.json` (protected by `flock`) tracks active sessions. The socket directory can be configured via the `PTY_SOCKET_DIR` environment variable or the `--socket-dir <path>` flag (accepted both before and after the subcommand: `pty --socket-dir X spawn ...` and `pty spawn --socket-dir X ...` are equivalent). Both client and server invocations must agree on the value (the `--socket-dir` flag sets the env var so that daemonized servers inherit it).
 
 ## Tests
 

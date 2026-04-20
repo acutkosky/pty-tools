@@ -2268,3 +2268,79 @@ class TestRingBufferReaderProgress:
         assert probe_done.get("status") == "ok"
         assert probe_done.get("truncated", 0) >= truncated_before
         assert "PROBE" in probe_done.get("response", "")
+
+
+class TestSocketDirFlagPosition:
+    """--socket-dir should work before OR after the subcommand."""
+
+    def setup_method(self):
+        ts = int(time.time() * 1000)
+        self.dir = f"/tmp/pty_socket_dir_test_{os.getpid()}_{ts}"
+        os.makedirs(self.dir, exist_ok=True)
+        self.session_id = f"test_sd_{os.getpid()}_{ts}"
+
+    def teardown_method(self):
+        # Kill any server we spawned in our custom dir, then remove the dir.
+        env = {**os.environ, "PTY_SOCKET_DIR": self.dir}
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pty_tools.cli", "exit", self.session_id],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+        except Exception:
+            pass
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _run_cli(self, *args):
+        # Always run in an env without PTY_SOCKET_DIR so the flag is the
+        # only thing that can route to our custom directory.
+        env = {k: v for k, v in os.environ.items() if k != "PTY_SOCKET_DIR"}
+        return subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", *args],
+            capture_output=True, text=True, timeout=15, env=env,
+        )
+
+    def test_top_level_placement_routes_to_custom_dir(self):
+        """`pty --socket-dir X spawn ...` creates the session under X."""
+        proc = self._run_cli("--socket-dir", self.dir, "spawn", "--detach",
+                             self.session_id, "sleep", "60")
+        assert proc.returncode == 0, f"stderr={proc.stderr!r} stdout={proc.stdout!r}"
+        payload = json.loads(proc.stdout)
+        assert payload["status"] == "ok"
+        # The socket must live under our custom dir, not the default.
+        assert payload["socket_path"].startswith(self.dir + "/")
+        # Registry file lands in the custom dir too.
+        assert os.path.exists(os.path.join(self.dir, "registry.json"))
+
+    def test_subcommand_placement_routes_to_custom_dir(self):
+        """`pty spawn --socket-dir X ...` is equivalent — flag after the subcommand."""
+        proc = self._run_cli("spawn", "--socket-dir", self.dir, "--detach",
+                             self.session_id, "sleep", "60")
+        assert proc.returncode == 0, f"stderr={proc.stderr!r} stdout={proc.stdout!r}"
+        payload = json.loads(proc.stdout)
+        assert payload["status"] == "ok"
+        assert payload["socket_path"].startswith(self.dir + "/")
+
+    def test_both_positions_see_same_registry(self):
+        """Spawn with flag in one position, list with flag in the other —
+        the list must include the session (proves they share the directory)."""
+        spawn = self._run_cli("--socket-dir", self.dir, "spawn", "--detach",
+                              self.session_id, "sleep", "60")
+        assert spawn.returncode == 0, spawn.stderr
+
+        listing = self._run_cli("list", "--socket-dir", self.dir)
+        assert listing.returncode == 0, listing.stderr
+        sessions = json.loads(listing.stdout)
+        ids = [s["session_id"] for s in sessions]
+        assert self.session_id in ids
+
+    def test_subparser_does_not_clobber_top_level_value(self):
+        """When the flag is given at the top level but NOT on the subcommand,
+        the subparser must not overwrite it with its default (SUPPRESS guards
+        against that)."""
+        spawn = self._run_cli("--socket-dir", self.dir, "spawn", "--detach",
+                              self.session_id, "sleep", "60")
+        assert spawn.returncode == 0, spawn.stderr
+        payload = json.loads(spawn.stdout)
+        assert payload["socket_path"].startswith(self.dir + "/")
