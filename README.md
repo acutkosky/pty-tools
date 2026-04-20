@@ -35,10 +35,15 @@ All commands are subcommands of `pty`. All responses are JSON. Every response in
 ### pty spawn
 
 ```
-pty spawn <id> <cmd...> [--rows 24] [--cols 80] [--detach] [--time_limit SECONDS] [--buffer_limit SIZE]
+pty spawn [--rows 24] [--cols 80] [--detach] [--time_limit SECONDS] [--buffer_limit SIZE] <id> <cmd...>
 ```
 
-Spawn a process in a new PTY session. `<cmd>` may be either a single shlex-quoted string (`'ls -la'`) or space-separated argv words (`ls -la`).
+Spawn a process in a new PTY session. `<cmd>` may be either a single shlex-quoted string (`'ls -la'`) or space-separated argv words (`ls -la`). Everything after `<id>` is treated as the child's argv, so any pty-spawn options must appear **before** `<id>`:
+
+```bash
+pty spawn --detach --rows 40 myshell ls -la   # --rows applies to the PTY
+pty spawn myshell ls --rows 40                # --rows is passed to `ls`
+```
 
 By default, the server runs in the **foreground**: stdin is forwarded to the PTY line-by-line, and raw PTY output is streamed to stdout. The session is also accessible via socket commands (`pty read`, `pty write`, etc.) from other processes. Status JSON is printed to stderr. The server exits when the child process exits, or on Ctrl+C.
 
