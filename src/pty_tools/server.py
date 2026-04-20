@@ -799,9 +799,9 @@ def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 
 
     cmd_args = [sys.executable, "-m", "pty_tools.server", session_id, command,
                 "--rows", str(rows), "--cols", str(cols),
-                "--buffer_limit", str(buffer_limit)]
+                "--buffer-limit", str(buffer_limit)]
     if time_limit is not None:
-        cmd_args.extend(["--time_limit", str(time_limit)])
+        cmd_args.extend(["--time-limit", str(time_limit)])
 
     proc = subprocess.Popen(
         cmd_args,
@@ -876,8 +876,8 @@ if __name__ == "__main__":
     parser.add_argument("--rows", type=int, default=24)
     parser.add_argument("--cols", type=int, default=80)
     parser.add_argument("--foreground", action="store_true")
-    parser.add_argument("--time_limit", type=float, default=None)
-    parser.add_argument("--buffer_limit", type=parse_buffer_limit, default=DEFAULT_BUFFER_LIMIT)
+    parser.add_argument("--time-limit", type=float, default=None)
+    parser.add_argument("--buffer-limit", type=parse_buffer_limit, default=DEFAULT_BUFFER_LIMIT)
     args = parser.parse_args()
 
     try:

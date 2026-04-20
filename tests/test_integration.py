@@ -1302,7 +1302,7 @@ class TestTimeLimit:
         """
         proc = subprocess.Popen(
             [sys.executable, "-m", "pty_tools.server",
-             self.session_id, "sleep 60", "--foreground", "--time_limit", "2"],
+             self.session_id, "sleep 60", "--foreground", "--time-limit", "2"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1315,10 +1315,10 @@ class TestTimeLimit:
         )
 
     def test_time_limit_via_cli(self):
-        """CLI --time_limit flag should work with --detach."""
+        """CLI --time-limit flag should work with --detach."""
         proc = subprocess.run(
             [sys.executable, "-m", "pty_tools.cli", "spawn", "--detach",
-             "--time_limit", "2", self.session_id, "sleep 60"],
+             "--time-limit", "2", self.session_id, "sleep 60"],
             capture_output=True, text=True, timeout=10,
         )
         assert proc.returncode == 0
@@ -1820,10 +1820,10 @@ class TestBufferLimit:
                 parse_buffer_limit(bad)
 
     def test_cli_rejects_invalid_buffer_limit(self):
-        """Invalid --buffer_limit on the CLI should fail argparse."""
+        """Invalid --buffer-limit on the CLI should fail argparse."""
         proc = subprocess.run(
             [sys.executable, "-m", "pty_tools.cli", "spawn",
-             "--detach", "--buffer_limit", "nope",
+             "--detach", "--buffer-limit", "nope",
              self.session_id, "sh"],
             capture_output=True, text=True, timeout=10,
         )

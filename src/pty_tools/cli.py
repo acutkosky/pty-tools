@@ -210,10 +210,10 @@ def _force_cleanup(session_id: str):
 
 def _add_read_args(parser):
     """Add common read/interact arguments."""
-    parser.add_argument("--total_timeout", type=int, default=5000, help="Total timeout in ms (default: 5000)")
-    parser.add_argument("--stable_timeout", type=int, default=500, help="Stable timeout in ms (default: 500)")
+    parser.add_argument("--total-timeout", type=int, default=5000, help="Total timeout in ms (default: 5000)")
+    parser.add_argument("--stable-timeout", type=int, default=500, help="Stable timeout in ms (default: 500)")
     parser.add_argument("--pattern", help="Regex pattern to wait for")
-    parser.add_argument("--no_strip_ansi", action="store_true", help="Preserve ANSI escape sequences")
+    parser.add_argument("--no-strip-ansi", action="store_true", help="Preserve ANSI escape sequences")
     parser.add_argument("--peek", action="store_true", help="Read without consuming output")
 
 
@@ -243,9 +243,9 @@ def main(argv=None):
     p.add_argument("--cols", type=int, default=80, help="Terminal columns (default: 80)")
     p.add_argument("--detach", action="store_true",
                    help="Daemonize the server (default: run in foreground)")
-    p.add_argument("--time_limit", type=float, default=None,
+    p.add_argument("--time-limit", type=float, default=None,
                    help="Maximum lifetime in seconds; process is killed when exceeded")
-    p.add_argument("--buffer_limit", type=parse_buffer_limit, default=DEFAULT_BUFFER_LIMIT,
+    p.add_argument("--buffer-limit", type=parse_buffer_limit, default=DEFAULT_BUFFER_LIMIT,
                    help="Max bytes retained from child output in a ring buffer "
                         "(suffixes K/M/G, binary; e.g. 64M, 1G). Default: 256M. "
                         "Evictions are reported as 'truncated' in read/screen responses.")
@@ -316,7 +316,7 @@ def main(argv=None):
     p.add_argument("--drain", action="store_true",
                    help="Kill child, flush remaining PTY output, and return "
                         "it (plus exit_code/signal) before shutdown")
-    p.add_argument("--no_strip_ansi", action="store_true",
+    p.add_argument("--no-strip-ansi", action="store_true",
                    help="With --drain, preserve ANSI escape sequences in output")
     p.set_defaults(func=cmd_exit)
 

@@ -18,7 +18,7 @@ pty spawn myshell sh
 pty spawn --detach myshell sh
 
 # Send a command and get output
-pty interact myshell --input "echo hello\n" --stable_timeout 500
+pty interact myshell --input "echo hello\n" --stable-timeout 500
 # {"status": "ok", "exited": false, "response": "$ echo hello\r\nhello\r\n$ "}
 
 # List active sessions
@@ -35,7 +35,7 @@ All commands are subcommands of `pty`. All responses are JSON. Every response in
 ### pty spawn
 
 ```
-pty spawn [--rows 24] [--cols 80] [--detach] [--time_limit SECONDS] [--buffer_limit SIZE] <id> <cmd...>
+pty spawn [--rows 24] [--cols 80] [--detach] [--time-limit SECONDS] [--buffer-limit SIZE] <id> <cmd...>
 ```
 
 Spawn a process in a new PTY session. `<cmd>` may be either a single shlex-quoted string (`'ls -la'`) or space-separated argv words (`ls -la`). Everything after `<id>` is treated as the child's argv, so any pty-spawn options must appear **before** `<id>`:
@@ -58,17 +58,17 @@ pty spawn myshell sh
 echo "ls -la" | pty spawn myshell sh > output.txt 2>/dev/null &
 ```
 
-Use `--time_limit` to set a maximum lifetime in seconds. When the limit expires, the child process is killed and the session is cleaned up. If omitted, the process runs until it exits on its own or is explicitly terminated.
+Use `--time-limit` to set a maximum lifetime in seconds. When the limit expires, the child process is killed and the session is cleaned up. If omitted, the process runs until it exits on its own or is explicitly terminated.
 
 ```bash
 # Kill the process after 30 seconds
-pty spawn --detach --time_limit 30 myshell 'long-running-command'
+pty spawn --detach --time-limit 30 myshell 'long-running-command'
 ```
 
-Use `--buffer_limit` to cap how much child output is retained in memory if no one is reading it. The server keeps a ring buffer of the most recent `SIZE` bytes; older bytes are evicted as new output arrives. Accepts an integer with an optional binary suffix: `4096`, `64K`, `256M`, `1G` (case-insensitive, optional `iB` is tolerated; `K=1024`, `M=1024²`, `G=1024³`). Default is 256M. Every `pty read` / `pty interact` / `pty read --screen` response includes a `"truncated"` field — the cumulative number of output bytes that were dropped from the ring buffer before any reader consumed them. The counter is monotonic for the lifetime of the session, so clients can diff across reads to detect new loss.
+Use `--buffer-limit` to cap how much child output is retained in memory if no one is reading it. The server keeps a ring buffer of the most recent `SIZE` bytes; older bytes are evicted as new output arrives. Accepts an integer with an optional binary suffix: `4096`, `64K`, `256M`, `1G` (case-insensitive, optional `iB` is tolerated; `K=1024`, `M=1024²`, `G=1024³`). Default is 256M. Every `pty read` / `pty interact` / `pty read --screen` response includes a `"truncated"` field — the cumulative number of output bytes that were dropped from the ring buffer before any reader consumed them. The counter is monotonic for the lifetime of the session, so clients can diff across reads to detect new loss.
 
 ```bash
-pty spawn --detach --buffer_limit 64M myshell 'noisy-command'
+pty spawn --detach --buffer-limit 64M myshell 'noisy-command'
 ```
 
 With `--detach`, the server runs as a detached background process — the command returns immediately once the session is ready. Detached sessions survive the parent process exiting (including SSH logout).
@@ -97,7 +97,7 @@ pty write myshell --input 'echo hello\n'
 ### pty read
 
 ```
-pty read <id> [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi] [--peek] [--screen]
+pty read <id> [--total-timeout 5000] [--stable-timeout 500] [--pattern REGEX] [--no-strip-ansi] [--peek] [--screen]
 ```
 
 Read output since the last read. Returns JSON:
@@ -110,7 +110,7 @@ Read output since the last read. Returns JSON:
 }
 ```
 
-`truncated` is the cumulative number of output bytes dropped from the ring buffer (see `--buffer_limit` on `pty spawn`); it's zero unless the buffer has overflowed.
+`truncated` is the cumulative number of output bytes dropped from the ring buffer (see `--buffer-limit` on `pty spawn`); it's zero unless the buffer has overflowed.
 
 When the child process exits, includes exit status:
 ```json
@@ -123,11 +123,11 @@ When the child process exits, includes exit status:
 }
 ```
 
-**Timeout behavior:** Wait up to `total_timeout` ms for the first byte. Once output starts, return after `stable_timeout` ms of silence (or when `total_timeout` expires, whichever comes first). If `--pattern` is given, return as soon as the output matches the regex.
+**Timeout behavior:** Wait up to `--total-timeout` ms for the first byte. Once output starts, return after `--stable-timeout` ms of silence (or when `--total-timeout` expires, whichever comes first). If `--pattern` is given, return as soon as the output matches the regex.
 
 By default, a read **consumes** the output — subsequent reads only see new data. Use `--peek` to read without consuming: the output is buffered and included in the next read. A normal read (without `--peek`) clears the buffer. This is useful for monitoring a session without interfering with a primary reader.
 
-ANSI escape sequences are stripped by default. Use `--no_strip_ansi` to preserve them.
+ANSI escape sequences are stripped by default. Use `--no-strip-ansi` to preserve them.
 
 Use `--screen` to get a snapshot of the virtual terminal screen instead of the read buffer. This uses [pyte](https://github.com/selectel/pyte) to maintain a virtual terminal that tracks all PTY output. The screen snapshot is independent of the read buffer — it doesn't consume it, and reflects what a user would currently see on the terminal (after cursor movement, clears, scrolling, etc.).
 
@@ -139,7 +139,7 @@ pty read myshell --screen
 ### pty interact
 
 ```
-pty interact <id> --input TEXT [--total_timeout 5000] [--stable_timeout 500] [--pattern REGEX] [--no_strip_ansi] [--peek]
+pty interact <id> --input TEXT [--total-timeout 5000] [--stable-timeout 500] [--pattern REGEX] [--no-strip-ansi] [--peek]
 ```
 
 Atomic write-then-read. Sends `TEXT` and reads the response in a single operation, avoiding race conditions between separate write and read calls. Output format is the same as `pty read`:
@@ -224,7 +224,7 @@ pty list
 ### pty exit
 
 ```
-pty exit <id> [--drain] [--no_strip_ansi]
+pty exit <id> [--drain] [--no-strip-ansi]
 ```
 
 Terminate a session. If the server is unresponsive, force-kills the process and cleans up the socket and registry.
