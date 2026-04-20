@@ -35,7 +35,7 @@ All commands are subcommands of `pty`. All responses are JSON. Every response in
 ### pty spawn
 
 ```
-pty spawn <id> <cmd> [--rows 24] [--cols 80] [--detach] [--time_limit SECONDS]
+pty spawn <id> <cmd> [--rows 24] [--cols 80] [--detach] [--time_limit SECONDS] [--buffer_limit SIZE]
 ```
 
 Spawn a process in a new PTY session.
@@ -58,6 +58,12 @@ Use `--time_limit` to set a maximum lifetime in seconds. When the limit expires,
 ```bash
 # Kill the process after 30 seconds
 pty spawn --detach --time_limit 30 myshell 'long-running-command'
+```
+
+Use `--buffer_limit` to cap how much child output is retained in memory if no one is reading it. The server keeps a ring buffer of the most recent `SIZE` bytes; older bytes are evicted as new output arrives. Accepts an integer with an optional binary suffix: `4096`, `64K`, `256M`, `1G` (case-insensitive, optional `iB` is tolerated; `K=1024`, `M=1024²`, `G=1024³`). Default is 256M. Every `pty read` / `pty interact` / `pty read --screen` response includes a `"truncated"` field — the cumulative number of output bytes that were dropped from the ring buffer before any reader consumed them. The counter is monotonic for the lifetime of the session, so clients can diff across reads to detect new loss.
+
+```bash
+pty spawn --detach --buffer_limit 64M myshell 'noisy-command'
 ```
 
 With `--detach`, the server runs as a detached background process — the command returns immediately once the session is ready. Detached sessions survive the parent process exiting (including SSH logout).
@@ -94,9 +100,12 @@ Read output since the last read. Returns JSON:
 {
   "status": "ok",
   "exited": false,
+  "truncated": 0,
   "response": "..."
 }
 ```
+
+`truncated` is the cumulative number of output bytes dropped from the ring buffer (see `--buffer_limit` on `pty spawn`); it's zero unless the buffer has overflowed.
 
 When the child process exits, includes exit status:
 ```json

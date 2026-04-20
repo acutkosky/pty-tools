@@ -14,7 +14,7 @@ from pty_tools.common import (
     socket_path_for,
     unregister_session,
 )
-from pty_tools.server import daemonize_server, run_server
+from pty_tools.server import DEFAULT_BUFFER_LIMIT, daemonize_server, parse_buffer_limit, run_server
 
 
 def cmd_spawn(args):
@@ -25,7 +25,8 @@ def cmd_spawn(args):
 
     if args.detach:
         result = daemonize_server(args.id, args.cmd, rows=args.rows, cols=args.cols,
-                                  time_limit=args.time_limit)
+                                  time_limit=args.time_limit,
+                                  buffer_limit=args.buffer_limit)
         print(json.dumps(result))
         if result["status"] != "ok":
             sys.exit(1)
@@ -38,7 +39,7 @@ def cmd_spawn(args):
         }
         print(json.dumps(status), file=sys.stderr)
         rc = run_server(args.id, args.cmd, rows=args.rows, cols=args.cols, foreground=True,
-                        time_limit=args.time_limit)
+                        time_limit=args.time_limit, buffer_limit=args.buffer_limit)
         sys.exit(rc)
 
 
@@ -221,6 +222,10 @@ def main(argv=None):
                    help="Daemonize the server (default: run in foreground)")
     p.add_argument("--time_limit", type=float, default=None,
                    help="Maximum lifetime in seconds; process is killed when exceeded")
+    p.add_argument("--buffer_limit", type=parse_buffer_limit, default=DEFAULT_BUFFER_LIMIT,
+                   help="Max bytes retained from child output in a ring buffer "
+                        "(suffixes K/M/G, binary; e.g. 64M, 1G). Default: 256M. "
+                        "Evictions are reported as 'truncated' in read/screen responses.")
     p.set_defaults(func=cmd_spawn)
 
     # write

@@ -138,12 +138,6 @@ class TestFullLifecycle:
         assert result["status"] == "ok"
         assert "MARKER_DONE" in result["response"]
 
-    def test_duplicate_session_check(self):
-        result = daemonize_server(self.session_id, "sh")
-        assert result["status"] == "ok"
-
-        assert is_server_alive(self.session_id)
-
     def test_stale_cleanup(self):
         """Registering a session with a dead PID should be cleaned up by is_server_alive."""
         from pty_tools.common import register_session
@@ -195,9 +189,13 @@ class TestFullLifecycle:
             {"type": "read", "total_timeout": 3000, "stable_timeout": 300},
             timeout=5.0,
         )
-        # Let the server's post-response _shutdown finish before asserting
-        # the connection fails.
-        time.sleep(0.5)
+        # Poll for the post-response _shutdown to finish rather than sleeping.
+        sock = socket_path_for(self.session_id)
+        for _ in range(40):
+            if not sock.exists():
+                break
+            time.sleep(0.05)
+        assert not sock.exists(), "server did not shut down after drain"
 
         with pytest.raises(PTYClientError):
             send_request(
@@ -212,59 +210,69 @@ class TestFullLifecycle:
             )
 
     def test_strip_ansi_default(self):
-        """ANSI escapes should be stripped by default."""
+        """ANSI escapes are stripped by default and preserved with strip_ansi=False."""
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
+        # Drain initial prompt.
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+        # printf emits a real ANSI escape — test would be vacuous without it
+        # (echo hello produces no escapes, so strip vs. preserve is indistinguishable).
+        ansi_cmd = "printf '\\033[31mRED_TEXT\\033[0m\\n'\n"
 
         result_default = send_request(
             self.session_id,
-            {
-                "type": "interact",
-                "text": "echo hello\n",
-                "total_timeout": 3000,
-                "stable_timeout": 500,
-            },
+            {"type": "interact", "text": ansi_cmd,
+             "total_timeout": 3000, "stable_timeout": 500},
             timeout=10.0,
         )
         assert result_default["status"] == "ok"
-        assert "hello" in result_default["response"]
+        assert "RED_TEXT" in result_default["response"]
+        assert "\x1b[31m" not in result_default["response"]
+        assert "\x1b[0m" not in result_default["response"]
         assert "\x1b" not in result_default["response"]
 
-        # With strip_ansi=False, escapes should be preserved
+        # With strip_ansi=False the raw escapes must be present.
         result_with_ansi = send_request(
             self.session_id,
-            {
-                "type": "interact",
-                "text": "echo hello\n",
-                "total_timeout": 3000,
-                "stable_timeout": 500,
-                "strip_ansi": False,
-            },
+            {"type": "interact", "text": ansi_cmd,
+             "total_timeout": 3000, "stable_timeout": 500,
+             "strip_ansi": False},
             timeout=10.0,
         )
         assert result_with_ansi["status"] == "ok"
-        assert "hello" in result_with_ansi["response"]
+        assert "RED_TEXT" in result_with_ansi["response"]
+        assert "\x1b[31m" in result_with_ansi["response"]
+        assert "\x1b[0m" in result_with_ansi["response"]
 
     def test_spawn_bad_command_reports_error(self):
         """Spawning a nonexistent command should report a meaningful error."""
         result = daemonize_server(self.session_id, "/nonexistent/command/xyz")
         assert result["status"] == "error"
-        assert "did not start" in result["error"] or "nonexistent" in result["error"].lower()
+        assert "did not start" in result["error"]
+        # Neither socket nor registry entry should remain after a failed spawn.
+        assert not socket_path_for(self.session_id).exists()
+        assert self.session_id not in read_registry()
 
-    def test_read_response_has_status(self):
-        """All read/interact responses should include status field."""
+    def test_duplicate_spawn_rejected_by_cli(self):
+        """CLI should reject `spawn --detach` against an already-running session."""
         result = daemonize_server(self.session_id, "sh")
         assert result["status"] == "ok"
+        assert is_server_alive(self.session_id)
 
-        # Plain read
-        read_result = send_request(
-            self.session_id,
-            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
-            timeout=5.0,
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "spawn", "--detach",
+             self.session_id, "sh"],
+            capture_output=True, text=True, timeout=10,
         )
-        assert read_result["status"] == "ok"
-        assert "exited" in read_result
-        assert "response" in read_result
+        assert proc.returncode != 0
+        payload = json.loads(proc.stdout)
+        assert payload["status"] == "error"
+        assert "already exists" in payload["error"]
 
 
 class TestNoEcho:
@@ -700,14 +708,17 @@ class TestForeground:
         assert "stdin_fwd_test" in result["response"]
 
     def test_foreground_child_exit_shuts_down(self):
-        """When the child exits in foreground mode, the server should shut down."""
+        """When the child exits cleanly, the server forwards that exit code."""
         proc, _ = self._spawn_foreground(
             command="sh", stdin_lines=["exit 0"]
         )
-
-        # The server should shut down after child exits
         proc.wait(timeout=10.0)
-        assert proc.returncode is not None, "Server did not shut down after child exit"
+        assert proc.returncode == 0, (
+            f"expected server to propagate child's exit 0, got {proc.returncode}"
+        )
+        # Socket and registry must be cleaned up on shutdown.
+        assert not socket_path_for(self.session_id).exists()
+        assert not is_server_alive(self.session_id)
 
     def test_foreground_exit_code_zero(self):
         """Foreground mode should forward exit code 0."""
@@ -802,7 +813,11 @@ class TestForeground:
         send_request(self.session_id, {"type": "exit"}, timeout=10.0)
 
     def test_foreground_sigterm_shuts_down_server(self):
-        """SIGTERM to a foreground server triggers shutdown and cleanup."""
+        """SIGTERM to a foreground server forwards SIGTERM to the child and cleans up.
+
+        `sleep` has no SIGTERM handler, so it dies from the signal. The server
+        translates that to exit code 128+SIGTERM (=143).
+        """
         proc, _ = self._spawn_foreground(command="sleep 30")
         # Give the server time to finish installing signal handlers.
         time.sleep(0.3)
@@ -810,7 +825,10 @@ class TestForeground:
         os.kill(proc.pid, signal.SIGTERM)
         proc.wait(timeout=10.0)
 
-        assert proc.returncode is not None
+        assert proc.returncode == 128 + signal.SIGTERM, (
+            f"expected 128+SIGTERM={128 + signal.SIGTERM} (child killed by "
+            f"forwarded SIGTERM), got {proc.returncode}"
+        )
         assert not socket_path_for(self.session_id).exists()
         assert not is_server_alive(self.session_id)
 
@@ -1277,7 +1295,11 @@ class TestTimeLimit:
         assert read_result["exited"] is True
 
     def test_time_limit_foreground_mode(self):
-        """Foreground mode should also respect time_limit."""
+        """Foreground mode should also respect time_limit.
+
+        Time-limit expiration SIGKILLs the child, so the server forwards
+        128+SIGKILL (=137) as its exit code.
+        """
         proc = subprocess.Popen(
             [sys.executable, "-m", "pty_tools.server",
              self.session_id, "sleep 60", "--foreground", "--time_limit", "2"],
@@ -1286,9 +1308,11 @@ class TestTimeLimit:
             stderr=subprocess.PIPE,
         )
 
-        # Wait for the time limit to kill it
         proc.wait(timeout=10.0)
-        assert proc.returncode is not None
+        assert proc.returncode == 128 + signal.SIGKILL, (
+            f"expected 128+SIGKILL={128 + signal.SIGKILL} from time-limit kill, "
+            f"got {proc.returncode}"
+        )
 
     def test_time_limit_via_cli(self):
         """CLI --time_limit flag should work with --detach."""
@@ -1450,8 +1474,8 @@ class TestSignal:
         _cleanup_session(self.session_id)
 
     def test_signal_by_name(self):
-        """Sending SIGKILL should terminate the child."""
-        result = daemonize_server(self.session_id, "sh")
+        """Sending SIGKILL by short name terminates the child with that exact signal."""
+        result = daemonize_server(self.session_id, "sleep 30")
         assert result["status"] == "ok"
 
         result = send_request(
@@ -1462,16 +1486,19 @@ class TestSignal:
         assert result["status"] == "ok"
         assert result["signal"] == "SIGKILL"
 
-        # Child should exit — the read waits for self.exited via _new_data.
+        # Read waits for exited via _new_data; verify exit was by SIGKILL.
         read_result = send_request(
             self.session_id,
             {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
             timeout=10.0,
         )
         assert read_result["exited"] is True
+        assert read_result["exit_code"] is None
+        assert read_result["signal"] == signal.SIGKILL
 
     def test_signal_by_full_name(self):
-        result = daemonize_server(self.session_id, "sh")
+        """SIGTERM by full name terminates the child with that exact signal."""
+        result = daemonize_server(self.session_id, "sleep 30")
         assert result["status"] == "ok"
 
         result = send_request(
@@ -1482,17 +1509,34 @@ class TestSignal:
         assert result["status"] == "ok"
         assert result["signal"] == "SIGTERM"
 
+        read_result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert read_result["exited"] is True
+        assert read_result["signal"] == signal.SIGTERM
+
     def test_signal_by_number(self):
-        result = daemonize_server(self.session_id, "sh")
+        """Signal by number (15 = SIGTERM) is resolved and delivered correctly."""
+        result = daemonize_server(self.session_id, "sleep 30")
         assert result["status"] == "ok"
 
         result = send_request(
             self.session_id,
-            {"type": "signal", "signal": 15},  # SIGTERM
+            {"type": "signal", "signal": 15},
             timeout=5.0,
         )
         assert result["status"] == "ok"
         assert result["signal"] == "SIGTERM"
+
+        read_result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert read_result["exited"] is True
+        assert read_result["signal"] == signal.SIGTERM
 
     def test_signal_unknown(self):
         result = daemonize_server(self.session_id, "sh")
@@ -1520,9 +1564,13 @@ class TestSignal:
             {"type": "read", "total_timeout": 3000, "stable_timeout": 300},
             timeout=5.0,
         )
-        # Let the server's post-response _shutdown finish before asserting
-        # the signal connection fails.
-        time.sleep(0.5)
+        # Poll for the post-response _shutdown to finish rather than sleeping.
+        sock = socket_path_for(self.session_id)
+        for _ in range(40):
+            if not sock.exists():
+                break
+            time.sleep(0.05)
+        assert not sock.exists(), "server did not shut down after drain"
 
         with pytest.raises(PTYClientError):
             send_request(
@@ -1614,3 +1662,169 @@ class TestErrorPaths:
 
         result = json.loads(response.decode())
         assert result["status"] == "error"
+
+
+class TestBufferLimit:
+    """Ring-buffer eviction and the `truncated` counter."""
+
+    def setup_method(self):
+        self.session_id = f"test_buflim_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_under_limit_no_truncation(self):
+        result = daemonize_server(self.session_id, "sh", buffer_limit=1024 * 1024)
+        assert result["status"] == "ok"
+        send_request(
+            self.session_id,
+            {"type": "interact", "text": "echo hello\n",
+             "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        result = send_request(
+            self.session_id,
+            {"type": "read", "peek": True, "total_timeout": 500, "stable_timeout": 200},
+            timeout=5.0,
+        )
+        assert result["truncated"] == 0
+
+    def test_overflow_drops_oldest(self):
+        """Writing more than buffer_limit evicts the oldest bytes, counter reflects drops."""
+        limit = 4096
+        result = daemonize_server(self.session_id, "cat", buffer_limit=limit)
+        assert result["status"] == "ok"
+
+        # Write enough data that at least `limit` bytes must be evicted.
+        # `cat` echoes stdin back, so the PTY output roughly equals input size
+        # (plus carriage-return translation). Send 3x the limit.
+        chunk = ("A" * 200 + "\n") * 80  # ~16 KiB
+        send_request(
+            self.session_id,
+            {"type": "write", "text": chunk},
+            timeout=10.0,
+        )
+        # Let cat produce all output and settle.
+        result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        # Buffer returned should be at most the limit.
+        assert len(result["response"]) <= limit
+        # And bytes must have been dropped.
+        assert result["truncated"] > 0
+
+    def test_truncated_counter_is_monotonic(self):
+        """Each read reports total-since-spawn; it never decreases."""
+        limit = 2048
+        result = daemonize_server(self.session_id, "cat", buffer_limit=limit)
+        assert result["status"] == "ok"
+
+        # First overflow
+        send_request(
+            self.session_id,
+            {"type": "write", "text": ("X" * 200 + "\n") * 30},
+            timeout=10.0,
+        )
+        r1 = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        first = r1["truncated"]
+        assert first > 0
+
+        # After a consuming read, the buffer is empty; reading again should
+        # report the SAME total (no new output since).
+        r2 = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 300, "stable_timeout": 100},
+            timeout=5.0,
+        )
+        assert r2["truncated"] == first, (
+            f"counter should stay at {first} when nothing dropped between reads, "
+            f"got {r2['truncated']}"
+        )
+
+        # Second overflow — counter must grow.
+        send_request(
+            self.session_id,
+            {"type": "write", "text": ("Y" * 200 + "\n") * 30},
+            timeout=10.0,
+        )
+        r3 = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert r3["truncated"] > first
+
+    def test_consumed_bytes_do_not_count_as_truncated(self):
+        """Bytes consumed by a normal read should NOT inflate the counter."""
+        limit = 64 * 1024
+        result = daemonize_server(self.session_id, "cat", buffer_limit=limit)
+        assert result["status"] == "ok"
+
+        # Stay well under the limit.
+        payload = "Z" * 1000 + "\n"
+        send_request(
+            self.session_id,
+            {"type": "write", "text": payload},
+            timeout=10.0,
+        )
+        r = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert r["truncated"] == 0
+        # Read a second time — still zero, consumption is not truncation.
+        r2 = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 300, "stable_timeout": 100},
+            timeout=5.0,
+        )
+        assert r2["truncated"] == 0
+
+    def test_screen_response_includes_truncated(self):
+        limit = 4096
+        result = daemonize_server(self.session_id, "cat", buffer_limit=limit)
+        assert result["status"] == "ok"
+        send_request(
+            self.session_id,
+            {"type": "write", "text": ("Q" * 200 + "\n") * 80},
+            timeout=10.0,
+        )
+        # Let output settle in the buffer via a peek.
+        send_request(
+            self.session_id,
+            {"type": "read", "peek": True, "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        screen = send_request(self.session_id, {"type": "screen"}, timeout=5.0)
+        assert "truncated" in screen
+        assert screen["truncated"] > 0
+
+    def test_parse_buffer_limit(self):
+        from pty_tools.server import parse_buffer_limit
+        assert parse_buffer_limit("4096") == 4096
+        assert parse_buffer_limit("64K") == 64 * 1024
+        assert parse_buffer_limit("64k") == 64 * 1024
+        assert parse_buffer_limit("64KiB") == 64 * 1024
+        assert parse_buffer_limit("256M") == 256 * 1024 * 1024
+        assert parse_buffer_limit("1G") == 1024**3
+        for bad in ("", "0", "-5", "5XB", "abc"):
+            with pytest.raises(ValueError):
+                parse_buffer_limit(bad)
+
+    def test_cli_rejects_invalid_buffer_limit(self):
+        """Invalid --buffer_limit on the CLI should fail argparse."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "spawn",
+             "--detach", "--buffer_limit", "nope",
+             self.session_id, "sh"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert proc.returncode != 0

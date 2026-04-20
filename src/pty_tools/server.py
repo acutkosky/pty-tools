@@ -31,6 +31,41 @@ from pty_tools.common import (
 # Regex to strip ANSI escape sequences from raw output
 _ANSI_RE = re.compile(r"\x1b\[[\x20-\x3f]*[0-9;]*[\x20-\x7e]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[>=<]")
 
+DEFAULT_BUFFER_LIMIT = 256 * 1024 * 1024  # 256 MiB
+
+_BUFFER_LIMIT_UNITS = {"": 1, "B": 1, "K": 1024, "M": 1024**2, "G": 1024**3}
+
+
+def parse_buffer_limit(value: str) -> int:
+    """Parse a size string like '64M', '256MiB', '1G', or '4096' into bytes.
+
+    Accepts an optional suffix K/M/G (case-insensitive, optional 'iB' tolerated).
+    Units are binary (K=1024). Must be a positive integer number of bytes.
+    """
+    s = str(value).strip()
+    if not s:
+        raise ValueError("buffer limit must not be empty")
+    i = 0
+    while i < len(s) and (s[i].isdigit() or s[i] == "."):
+        i += 1
+    num_part, unit_part = s[:i], s[i:].strip().upper()
+    if not num_part:
+        raise ValueError(f"buffer limit missing number: {value!r}")
+    if unit_part.endswith("IB"):
+        unit_part = unit_part[:-2]
+    elif unit_part.endswith("B") and unit_part not in ("B",):
+        unit_part = unit_part[:-1]
+    if unit_part not in _BUFFER_LIMIT_UNITS:
+        raise ValueError(f"unknown buffer limit unit: {value!r}")
+    try:
+        n = float(num_part)
+    except ValueError as e:
+        raise ValueError(f"invalid buffer limit number: {value!r}") from e
+    result = int(n * _BUFFER_LIMIT_UNITS[unit_part])
+    if result <= 0:
+        raise ValueError(f"buffer limit must be positive: {value!r}")
+    return result
+
 
 def _open_pty(rows: int, cols: int):
     """Create a PTY pair and set the terminal size. Returns (master_fd, slave_fd)."""
@@ -51,7 +86,8 @@ class PTYServer:
     """Manages a single PTY session with an async Unix socket interface."""
 
     def __init__(self, session_id: str, command: str, rows: int = 24, cols: int = 80,
-                 foreground: bool = False, time_limit: float | None = None):
+                 foreground: bool = False, time_limit: float | None = None,
+                 buffer_limit: int = DEFAULT_BUFFER_LIMIT):
         self.session_id = session_id
         self.command = command
         self.rows = rows
@@ -59,6 +95,7 @@ class PTYServer:
         self.sock_path = str(socket_path_for(session_id))
         self.foreground = foreground
         self.time_limit = time_limit
+        self.buffer_limit = buffer_limit
 
         self._master_fd: int | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -68,11 +105,15 @@ class PTYServer:
         self.read_lock = asyncio.Lock()
         self.write_lock = asyncio.Lock()
         self.read_buffer = bytearray()
+        # Total bytes that were appended to read_buffer and then evicted by
+        # the ring-buffer limit before any reader could consume them.
+        self._dropped_bytes = 0
         self._server: asyncio.Server | None = None
         self._new_data = asyncio.Event()
         self._stopped = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutting_down = False
+        self._child_exit_task: asyncio.Task | None = None
         # One asyncio task per tap target, each fed by its own queue.
         self._tap_senders: dict[str, tuple[asyncio.Queue, asyncio.Task]] = {}
 
@@ -123,7 +164,7 @@ class PTYServer:
         self._loop.add_reader(master_fd, self._on_readable)
 
         # Reap the child when it exits, record status, and wake readers.
-        asyncio.create_task(self._on_child_exit())
+        self._child_exit_task = asyncio.create_task(self._on_child_exit())
 
         # Foreground stdin is inherently blocking, so it stays in a thread
         # and dispatches writes into the loop.
@@ -191,6 +232,10 @@ class PTYServer:
     def _on_data(self, raw: bytes):
         """Called on the event loop when PTY produces output."""
         self.read_buffer.extend(raw)
+        overflow = len(self.read_buffer) - self.buffer_limit
+        if overflow > 0:
+            del self.read_buffer[:overflow]
+            self._dropped_bytes += overflow
         self._pyte_stream.feed(raw.decode("utf-8", errors="replace"))
         if self.foreground:
             sys.stdout.buffer.write(raw)
@@ -406,7 +451,8 @@ class PTYServer:
                 elif got_output:
                     break
 
-            result = {"status": "ok", "exited": self.exited}
+            result = {"status": "ok", "exited": self.exited,
+                      "truncated": self._dropped_bytes}
             if self.exited:
                 result["exit_code"] = self.exit_code
                 result["signal"] = self.exit_signal
@@ -460,6 +506,7 @@ class PTYServer:
             "response": "\n".join(lines),
             "rows": self._pyte_screen.lines,
             "cols": self._pyte_screen.columns,
+            "truncated": self._dropped_bytes,
         }
 
     async def _do_resize(self, msg: dict) -> dict:
@@ -523,6 +570,17 @@ class PTYServer:
             except ProcessLookupError:
                 pass
 
+        # Wait for _on_child_exit to record exit_code/exit_signal before we
+        # tear the loop down — otherwise run_server can't propagate them.
+        # (_on_child_exit itself calls _shutdown in foreground mode; skip the
+        # await when we're already running inside it to avoid self-deadlock.)
+        t = self._child_exit_task
+        if t is not None and t is not asyncio.current_task():
+            try:
+                await t
+            except Exception:
+                pass
+
         if self._master_fd is not None:
             fd = self._master_fd
             self._master_fd = None
@@ -547,10 +605,11 @@ class PTYServer:
 
 
 def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
-               foreground: bool = False, time_limit: float | None = None) -> int:
+               foreground: bool = False, time_limit: float | None = None,
+               buffer_limit: int = DEFAULT_BUFFER_LIMIT) -> int:
     """Entry point for the server process. Returns the child's exit code (0 if unknown)."""
     server = PTYServer(session_id, command, rows=rows, cols=cols, foreground=foreground,
-                       time_limit=time_limit)
+                       time_limit=time_limit, buffer_limit=buffer_limit)
     try:
         asyncio.run(server.serve())
     except Exception:
@@ -563,7 +622,8 @@ def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
 
 
 def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
-                     time_limit: float | None = None) -> dict:
+                     time_limit: float | None = None,
+                     buffer_limit: int = DEFAULT_BUFFER_LIMIT) -> dict:
     """Launch a detached subprocess to run the PTY server. Returns status dict."""
     from pty_tools.common import ensure_socket_dir
 
@@ -576,7 +636,8 @@ def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 
     err_file = os.fdopen(err_fd, "w")
 
     cmd_args = [sys.executable, "-m", "pty_tools.server", session_id, command,
-                "--rows", str(rows), "--cols", str(cols)]
+                "--rows", str(rows), "--cols", str(cols),
+                "--buffer_limit", str(buffer_limit)]
     if time_limit is not None:
         cmd_args.extend(["--time_limit", str(time_limit)])
 
@@ -639,11 +700,13 @@ if __name__ == "__main__":
     parser.add_argument("--cols", type=int, default=80)
     parser.add_argument("--foreground", action="store_true")
     parser.add_argument("--time_limit", type=float, default=None)
+    parser.add_argument("--buffer_limit", type=parse_buffer_limit, default=DEFAULT_BUFFER_LIMIT)
     args = parser.parse_args()
 
     try:
         rc = run_server(args.session_id, args.command, rows=args.rows, cols=args.cols,
-                        foreground=args.foreground, time_limit=args.time_limit)
+                        foreground=args.foreground, time_limit=args.time_limit,
+                        buffer_limit=args.buffer_limit)
         sys.exit(rc)
     except Exception as e:
         print(str(e), file=sys.stderr)
