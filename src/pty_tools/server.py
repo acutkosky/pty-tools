@@ -114,6 +114,10 @@ class PTYServer:
         # Total bytes that were appended to read_buffer and then evicted by
         # the ring-buffer limit before any reader could consume them.
         self._dropped_bytes = 0
+        # Monotonic count of bytes ever appended to read_buffer. Used by
+        # readers to detect new output even when the ring buffer is at its
+        # limit (where length can't grow further).
+        self._total_appended = 0
         self._server: asyncio.Server | None = None
         self._new_data = asyncio.Event()
         self._stopped = asyncio.Event()
@@ -229,6 +233,25 @@ class PTYServer:
             return
         self._on_data(raw)
 
+    def _drain_pty_final(self):
+        """Synchronously pull any remaining bytes from the PTY master.
+
+        Used by exit --drain after killing the child: the reader callback
+        may not have run yet for the final burst, so we do the reads
+        directly. The fd is non-blocking, so EAGAIN/EIO both cleanly end.
+        """
+        fd = self._master_fd
+        if fd is None:
+            return
+        while True:
+            try:
+                raw = os.read(fd, 4096)
+            except (BlockingIOError, OSError):
+                return
+            if not raw:
+                return
+            self._on_data(raw)
+
     async def _on_child_exit(self):
         """Wait for the child process to exit, then record status and wake readers."""
         rc = await self._proc.wait()
@@ -256,8 +279,14 @@ class PTYServer:
                     fut = asyncio.run_coroutine_threadsafe(
                         self._do_write({"text": line}), self._loop
                     )
-                    fut.result(timeout=30.0)
-                except Exception:
+                    # No timeout: writes block on write_lock / PTY backpressure
+                    # the same way a real terminal does. A 30s cap would
+                    # silently drop stdin lines when the child was slow to
+                    # drain, with no way for the user to notice.
+                    fut.result()
+                except BaseException:
+                    # Loop gone, cancelled, or write failed — nothing to do
+                    # beyond exiting the stdin-forwarding thread.
                     break
         except (EOFError, OSError):
             pass
@@ -265,6 +294,7 @@ class PTYServer:
     def _on_data(self, raw: bytes):
         """Called on the event loop when PTY produces output."""
         self.read_buffer.extend(raw)
+        self._total_appended += len(raw)
         overflow = len(self.read_buffer) - self.buffer_limit
         if overflow > 0:
             del self.read_buffer[:overflow]
@@ -329,6 +359,8 @@ class PTYServer:
         """Route msg to its handler. Returns (response, shutdown_after)."""
         mtype = msg.get("type")
         if mtype == "exit":
+            if msg.get("drain"):
+                return await self._do_exit_drain(msg), True
             return {"status": "ok", "message": "Shutting down"}, True
         handlers = {
             "write": self._do_write,
@@ -358,6 +390,10 @@ class PTYServer:
         target_id = msg.get("target")
         if not target_id:
             return {"status": "error", "error": "Missing 'target' session ID"}
+        if target_id == self.session_id:
+            # Self-tap feeds every output byte back as input, causing
+            # unbounded amplification through the PTY's echo loop.
+            return {"status": "error", "error": "Cannot tap a session to itself"}
         if not is_server_alive(target_id):
             return {"status": "error", "error": f"Target session '{target_id}' is not running"}
         if target_id not in self._tap_senders:
@@ -428,85 +464,153 @@ class PTYServer:
     async def _do_interact(self, msg: dict) -> dict:
         if self.exited:
             return {"status": "error", "error": "Session has exited"}
-        # Hold write_lock across write+read so no other writer can interleave
-        # between our write and the response we collect for it.
-        async with self.write_lock:
-            err = await self._write_under_lock(msg.get("text", ""))
-            if err:
-                return {"status": "error", "error": err}
-            return await self._do_read(msg)
+        # Acquire read_lock FIRST so no concurrent read can steal our response.
+        # Write_lock nested inside prevents concurrent writes from interleaving
+        # output with ours. Lock order (read then write) is consistent across
+        # every call site that takes both, so no deadlock is possible.
+        async with self.read_lock:
+            async with self.write_lock:
+                err = await self._write_under_lock(msg.get("text", ""))
+                if err:
+                    return {"status": "error", "error": err}
+                return await self._read_body(msg)
 
     async def _do_read(self, msg: dict) -> dict:
+        async with self.read_lock:
+            return await self._read_body(msg)
+
+    async def _read_body(self, msg: dict) -> dict:
+        """Read buffer/pattern/timeout loop. Caller must hold self.read_lock."""
         total_timeout = msg.get("total_timeout", 5000) / 1000.0
         stable_timeout = msg.get("stable_timeout", 500) / 1000.0
         pattern = msg.get("pattern")
         strip_ansi = msg.get("strip_ansi", True)
         peek = msg.get("peek", False)
 
-        async with self.read_lock:
-            start = time.monotonic()
-            got_output = False
-            match_end = None
-            prev_buf_len = len(self.read_buffer)
+        start = time.monotonic()
+        got_output = False
+        match_end = None
+        # Track the monotonic "bytes appended" counter rather than buffer
+        # length — length can't grow once the ring buffer is at its limit, so
+        # a length-based check misses bursts that arrive during overflow.
+        prev_appended = self._total_appended
 
-            while True:
-                # Check pattern match against entire unconsumed buffer
-                if pattern:
-                    text = bytes(self.read_buffer).decode("utf-8", errors="replace")
-                    m = re.search(pattern, text)
-                    if m:
-                        match_end = m.end()
-                        break
-
-                if self.exited:
+        while True:
+            # Check pattern match against entire unconsumed buffer
+            if pattern:
+                text = bytes(self.read_buffer).decode("utf-8", errors="replace")
+                m = re.search(pattern, text)
+                if m:
+                    match_end = m.end()
                     break
 
-                elapsed = time.monotonic() - start
-                remaining = total_timeout - elapsed
-                if remaining <= 0:
-                    break
+            if self.exited or self._shutting_down:
+                break
 
-                wait_time = min(stable_timeout, remaining) if got_output else remaining
+            elapsed = time.monotonic() - start
+            remaining = total_timeout - elapsed
+            if remaining <= 0:
+                break
 
-                # Wait for the background reader to deliver new data
-                self._new_data.clear()
-                try:
-                    await asyncio.wait_for(self._new_data.wait(), timeout=wait_time)
-                except asyncio.TimeoutError:
-                    pass
+            wait_time = min(stable_timeout, remaining) if got_output else remaining
 
-                # If buffer grew, we got output — loop to re-check pattern/exit.
-                # If it didn't grow and we already had output, that's stable silence.
-                new_buf_len = len(self.read_buffer)
-                if new_buf_len > prev_buf_len:
-                    got_output = True
-                    prev_buf_len = new_buf_len
-                elif got_output:
-                    break
+            # Wait for the background reader to deliver new data
+            self._new_data.clear()
+            try:
+                await asyncio.wait_for(self._new_data.wait(), timeout=wait_time)
+            except asyncio.TimeoutError:
+                pass
 
-            result = {"status": "ok", "exited": self.exited,
-                      "truncated": self._dropped_bytes}
-            if self.exited:
-                result["exit_code"] = self.exit_code
-                result["signal"] = self.exit_signal
+            if self._total_appended > prev_appended:
+                got_output = True
+                prev_appended = self._total_appended
+            elif got_output:
+                break
 
-            # Consume buffer (pattern match consumes up to match; otherwise all).
-            # peek=True always leaves the buffer untouched.
-            if match_end is not None:
-                show = bytes(self.read_buffer[:match_end])
-                if not peek:
-                    self.read_buffer = bytearray(self.read_buffer[match_end:])
+        result = {"status": "ok", "exited": self.exited,
+                  "truncated": self._dropped_bytes}
+        if self.exited:
+            result["exit_code"] = self.exit_code
+            result["signal"] = self.exit_signal
+
+        # Consume buffer (pattern match consumes up to match; otherwise all).
+        # peek=True always leaves the buffer untouched.
+        if match_end is not None:
+            show = bytes(self.read_buffer[:match_end])
+            if not peek:
+                self.read_buffer = bytearray(self.read_buffer[match_end:])
+        else:
+            show = bytes(self.read_buffer)
+            if not peek:
+                self.read_buffer.clear()
+
+        text = show.decode("utf-8", errors="replace")
+        if strip_ansi:
+            text = _ANSI_RE.sub("", text)
+        result["response"] = text
+
+        return result
+
+    async def _do_exit_drain(self, msg: dict) -> dict:
+        """Kill child, flush remaining PTY output, return it with exit info.
+
+        Used when the client wants a guarantee that no trailing output is
+        lost on shutdown. After this returns, _handle_client will send the
+        response and then call _shutdown normally. We take ownership of the
+        child reap here (cancelling _on_child_exit) so it can't race with
+        the response write by triggering foreground-mode _shutdown mid-send.
+        """
+        t = self._child_exit_task
+        # Null the handle first so _shutdown won't re-await it after we
+        # cancel — its await of a cancelled task would raise in cleanup.
+        self._child_exit_task = None
+        if t is not None and not t.done():
+            t.cancel()
+            try:
+                await t
+            except BaseException:
+                pass
+
+        if self._proc and self._proc.returncode is None:
+            try:
+                self._proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+
+        if self._proc is not None and self._proc.returncode is not None and not self.exited:
+            rc = self._proc.returncode
+            if rc >= 0:
+                self.exit_code = rc
             else:
-                show = bytes(self.read_buffer)
-                if not peek:
-                    self.read_buffer.clear()
+                self.exit_signal = -rc
+            self.exited = True
 
+        # Pull any final bytes that the reader callback hadn't consumed.
+        self._drain_pty_final()
+
+        async with self.read_lock:
+            strip_ansi = msg.get("strip_ansi", True)
+            peek = msg.get("peek", False)
+            show = bytes(self.read_buffer)
+            if not peek:
+                self.read_buffer.clear()
             text = show.decode("utf-8", errors="replace")
             if strip_ansi:
                 text = _ANSI_RE.sub("", text)
-            result["response"] = text
-
-        return result
+            result = {
+                "status": "ok",
+                "exited": self.exited,
+                "truncated": self._dropped_bytes,
+                "response": text,
+            }
+            if self.exited:
+                result["exit_code"] = self.exit_code
+                result["signal"] = self.exit_signal
+            return result
 
     def _on_forward_signal(self, sig):
         """Forward a signal to the child process group, then shut down."""
@@ -611,6 +715,11 @@ class PTYServer:
             return
         self._shutting_down = True
 
+        # Wake any readers blocked on _new_data.wait() so they can observe
+        # the _shutting_down flag and return rather than sitting on their
+        # total_timeout while the server tears down around them.
+        self._new_data.set()
+
         # Cancel tap senders so they don't block on pending sends.
         for _, task in self._tap_senders.values():
             task.cancel()
@@ -625,12 +734,13 @@ class PTYServer:
         # Wait for _on_child_exit to record exit_code/exit_signal before we
         # tear the loop down — otherwise run_server can't propagate them.
         # (_on_child_exit itself calls _shutdown in foreground mode; skip the
-        # await when we're already running inside it to avoid self-deadlock.)
+        # await when we're already running inside it to avoid self-deadlock.
+        # Skip too if the task has been cleared/cancelled by _do_exit_drain.)
         t = self._child_exit_task
-        if t is not None and t is not asyncio.current_task():
+        if t is not None and t is not asyncio.current_task() and not t.done():
             try:
                 await t
-            except Exception:
+            except BaseException:
                 pass
 
         if self._master_fd is not None:

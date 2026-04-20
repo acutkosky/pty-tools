@@ -1953,3 +1953,318 @@ class TestSpawnRaces:
         payload = json.loads(proc.stdout)
         assert payload["status"] == "error"
         assert "already exists" in payload["error"]
+
+
+class TestInteractAtomicity:
+    """A concurrent read must not steal interact's response."""
+
+    def setup_method(self):
+        self.session_id = f"test_interact_atomic_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_concurrent_read_does_not_steal_interact_response(self):
+        """Reader A is parked waiting for data; client B runs interact. With the
+        old lock order (write_lock, then read_lock), B's write lands in the PTY
+        while A still holds read_lock — A wakes and eats B's response. With
+        read_lock acquired first, A has to finish before B's write goes out, so
+        B reliably reads its own output.
+        """
+        assert daemonize_server(self.session_id, "sh")["status"] == "ok"
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 400},
+            timeout=5.0,
+        )
+
+        a_result: dict = {}
+        b_result: dict = {}
+
+        def _parked_reader():
+            a_result.update(send_request(
+                self.session_id,
+                {"type": "read", "total_timeout": 3000, "stable_timeout": 2000},
+                timeout=10.0,
+            ))
+
+        def _interact():
+            time.sleep(0.3)  # let A acquire read_lock first
+            b_result.update(send_request(
+                self.session_id,
+                {"type": "interact", "text": "echo INTERACT_PAYLOAD_7\n",
+                 "total_timeout": 2000, "stable_timeout": 500,
+                 "pattern": "INTERACT_PAYLOAD_7"},
+                timeout=10.0,
+            ))
+
+        ta = threading.Thread(target=_parked_reader)
+        tb = threading.Thread(target=_interact)
+        ta.start(); tb.start()
+        ta.join(timeout=15.0); tb.join(timeout=15.0)
+
+        assert b_result.get("status") == "ok"
+        assert "INTERACT_PAYLOAD_7" in b_result.get("response", ""), (
+            f"interact lost its response to the parked reader; "
+            f"interact.response={b_result.get('response')!r}, "
+            f"parked_reader.response={a_result.get('response')!r}"
+        )
+
+
+class TestShutdownWakesReaders:
+    def setup_method(self):
+        self.session_id = f"test_shutdown_wake_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_exit_while_reader_blocked_returns_promptly(self):
+        """A reader with a long total_timeout must return near-instantly when
+        the server shuts down, not sit on its own timer. Before the fix, the
+        reader waited the full total_timeout because _shutdown never set
+        _new_data."""
+        assert daemonize_server(self.session_id, "sh")["status"] == "ok"
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 1000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+        read_elapsed: dict = {}
+
+        def _slow_reader():
+            t0 = time.monotonic()
+            try:
+                send_request(
+                    self.session_id,
+                    {"type": "read", "total_timeout": 30000, "stable_timeout": 1000},
+                    timeout=35.0,
+                )
+            except PTYClientError:
+                pass
+            read_elapsed["s"] = time.monotonic() - t0
+
+        t = threading.Thread(target=_slow_reader)
+        t.start()
+        time.sleep(0.3)
+
+        send_request(self.session_id, {"type": "exit"}, timeout=5.0)
+        t.join(timeout=10.0)
+
+        assert not t.is_alive(), "reader did not unblock after shutdown"
+        assert read_elapsed.get("s", 999) < 5.0, (
+            f"reader took {read_elapsed.get('s')}s to unblock after shutdown"
+        )
+
+
+class TestSelfTapRejected:
+    def setup_method(self):
+        self.session_id = f"test_selftap_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_tap_to_self_errors(self):
+        assert daemonize_server(self.session_id, "sh")["status"] == "ok"
+        result = send_request(
+            self.session_id,
+            {"type": "tap", "target": self.session_id},
+            timeout=5.0,
+        )
+        assert result["status"] == "error"
+        assert "itself" in result["error"]
+
+
+class TestExitDrain:
+    def setup_method(self):
+        self.session_id = f"test_drain_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_drain_returns_final_output_and_exit_info(self):
+        """Session with unread output: exit --drain surfaces that output
+        and the exit status in one call."""
+        assert daemonize_server(self.session_id, "sh")["status"] == "ok"
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+        send_request(
+            self.session_id,
+            {"type": "write", "text": "echo DRAIN_MARKER\n"},
+            timeout=5.0,
+        )
+        time.sleep(0.3)
+
+        result = send_request(
+            self.session_id,
+            {"type": "exit", "drain": True},
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "DRAIN_MARKER" in result["response"]
+        assert result["exited"] is True
+        assert result["signal"] == signal.SIGKILL
+        assert result["exit_code"] is None
+        assert "truncated" in result
+
+        for _ in range(30):
+            if not is_server_alive(self.session_id):
+                break
+            time.sleep(0.1)
+        assert not is_server_alive(self.session_id)
+
+    def test_plain_exit_still_returns_shutting_down(self):
+        """Regression: without --drain, response format is unchanged."""
+        assert daemonize_server(self.session_id, "sh")["status"] == "ok"
+        result = send_request(self.session_id, {"type": "exit"}, timeout=5.0)
+        assert result == {"status": "ok", "message": "Shutting down"}
+
+    def test_cli_drain_flag(self):
+        """The CLI --drain flag produces a drained response."""
+        assert daemonize_server(self.session_id, "sh")["status"] == "ok"
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+        send_request(
+            self.session_id,
+            {"type": "write", "text": "echo CLI_DRAIN_OK\n"},
+            timeout=5.0,
+        )
+        time.sleep(0.3)
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "exit", "--drain", self.session_id],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert proc.returncode == 0
+        payload = json.loads(proc.stdout)
+        assert payload["status"] == "ok"
+        assert "CLI_DRAIN_OK" in payload["response"]
+        assert payload["exited"] is True
+
+
+class TestSpawnMultiArg:
+    def setup_method(self):
+        self.session_id = f"test_spawn_multiarg_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_spawn_accepts_argv_form(self):
+        """pty spawn <id> sh -c '...' should work without shell-quoting."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "spawn", "--detach",
+             self.session_id, "sh", "-c", "echo MULTIARG_OK; sleep 60"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert proc.returncode == 0, f"stderr={proc.stderr!r} stdout={proc.stdout!r}"
+        payload = json.loads(proc.stdout)
+        assert payload["status"] == "ok"
+        result = send_request(
+            self.session_id,
+            {"type": "read", "pattern": "MULTIARG_OK",
+             "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert "MULTIARG_OK" in result["response"]
+
+    def test_spawn_single_quoted_string_still_works(self):
+        """Back-compat: single shlex-quoted string is still accepted."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "spawn", "--detach",
+             self.session_id, "sh -c 'echo SINGLE_OK; sleep 60'"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert proc.returncode == 0
+        payload = json.loads(proc.stdout)
+        assert payload["status"] == "ok"
+        result = send_request(
+            self.session_id,
+            {"type": "read", "pattern": "SINGLE_OK",
+             "total_timeout": 3000, "stable_timeout": 500},
+            timeout=10.0,
+        )
+        assert "SINGLE_OK" in result["response"]
+
+
+class TestRingBufferReaderProgress:
+    def setup_method(self):
+        self.session_id = f"test_ring_progress_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_reader_sees_output_when_buffer_at_limit(self):
+        """When the ring buffer is at its cap, new bytes evict older bytes and
+        len(buffer) stays constant. A length-based stability check would treat
+        that burst as silence. The fix tracks total-bytes-appended instead,
+        so the reader still sees the burst.
+        """
+        buf_cap = 16 * 1024
+        result = daemonize_server(
+            self.session_id, "sh", buffer_limit=buf_cap,
+        )
+        assert result["status"] == "ok"
+
+        # Fill buffer past capacity.
+        send_request(
+            self.session_id,
+            {"type": "write",
+             "text": f"printf 'PAD%.0s' $(seq 1 {buf_cap * 2})\n"},
+            timeout=5.0,
+        )
+        r = {"truncated": 0}
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            r = send_request(
+                self.session_id,
+                {"type": "read", "peek": True,
+                 "total_timeout": 200, "stable_timeout": 100},
+                timeout=5.0,
+            )
+            if r.get("truncated", 0) > 0:
+                break
+        assert r["truncated"] > 0, "buffer never overflowed — test setup failed"
+        truncated_before = r["truncated"]
+
+        # Drain buffer completely.
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 500, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+        probe_started = threading.Event()
+        probe_done: dict = {}
+
+        def _reader():
+            probe_started.set()
+            probe_done.update(send_request(
+                self.session_id,
+                {"type": "read", "total_timeout": 5000, "stable_timeout": 400},
+                timeout=10.0,
+            ))
+
+        t = threading.Thread(target=_reader)
+        t.start()
+        probe_started.wait()
+        time.sleep(0.1)
+
+        # Large burst that will force further eviction.
+        send_request(
+            self.session_id,
+            {"type": "write",
+             "text": f"printf 'PROBE%.0s' $(seq 1 {buf_cap * 3})\n"},
+            timeout=5.0,
+        )
+
+        t.join(timeout=15.0)
+        assert not t.is_alive(), "reader stalled under ring-buffer eviction"
+        assert probe_done.get("status") == "ok"
+        assert probe_done.get("truncated", 0) >= truncated_before
+        assert "PROBE" in probe_done.get("response", "")

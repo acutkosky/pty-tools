@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import shlex
 import signal
 import sys
 
@@ -18,13 +19,21 @@ from pty_tools.server import DEFAULT_BUFFER_LIMIT, daemonize_server, parse_buffe
 
 
 def cmd_spawn(args):
+    # `pty spawn <id> <cmd...>` accepts either a single shlex-quoted string
+    # ('ls -la') or argv-style words (ls -la). Multi-word forms are re-joined
+    # so the server sees a single shlex-parseable command string.
+    if not args.cmd:
+        print(json.dumps({"status": "error", "error": "Missing command"}))
+        sys.exit(1)
+    cmd_str = args.cmd[0] if len(args.cmd) == 1 else shlex.join(args.cmd)
+
     if is_server_alive(args.id):
         result = {"status": "error", "error": f"Session '{args.id}' already exists"}
         print(json.dumps(result))
         sys.exit(1)
 
     if args.detach:
-        result = daemonize_server(args.id, args.cmd, rows=args.rows, cols=args.cols,
+        result = daemonize_server(args.id, cmd_str, rows=args.rows, cols=args.cols,
                                   time_limit=args.time_limit,
                                   buffer_limit=args.buffer_limit)
         print(json.dumps(result))
@@ -34,11 +43,11 @@ def cmd_spawn(args):
         status = {
             "status": "ok",
             "session_id": args.id,
-            "command": args.cmd,
+            "command": cmd_str,
             "pid": os.getpid(),
         }
         print(json.dumps(status), file=sys.stderr)
-        rc = run_server(args.id, args.cmd, rows=args.rows, cols=args.cols, foreground=True,
+        rc = run_server(args.id, cmd_str, rows=args.rows, cols=args.cols, foreground=True,
                         time_limit=args.time_limit, buffer_limit=args.buffer_limit)
         sys.exit(rc)
 
@@ -93,7 +102,7 @@ def _send_read(session_id, msg):
 def cmd_read(args):
     if args.screen:
         try:
-            result = send_request(args.id, {"type": "screen"}, timeout=5.0)
+            result = send_request(args.id, {"type": "screen"}, timeout=30.0)
             print(json.dumps(result))
         except PTYClientError as e:
             print(json.dumps({"status": "error", "error": str(e)}))
@@ -170,8 +179,12 @@ def cmd_list(args):
 
 
 def cmd_exit(args):
+    msg = {"type": "exit"}
+    if args.drain:
+        msg["drain"] = True
+        msg["strip_ansi"] = not args.no_strip_ansi
     try:
-        result = send_request(args.id, {"type": "exit"}, timeout=10.0)
+        result = send_request(args.id, msg, timeout=10.0)
         print(json.dumps(result))
     except Exception:
         _force_cleanup(args.id)
@@ -215,7 +228,9 @@ def main(argv=None):
     p = sub.add_parser("spawn", help="Spawn a new PTY session",
                         description="Spawn a process in a new PTY session. Runs in foreground by default (stdin forwarded, PTY output streamed to stdout). Use --detach to daemonize.")
     p.add_argument("id", help="Session identifier")
-    p.add_argument("cmd", help="Command to run in the PTY")
+    p.add_argument("cmd", nargs=argparse.REMAINDER,
+                   help="Command to run in the PTY (accepts either a single "
+                        "shlex-quoted string or space-separated argv words)")
     p.add_argument("--rows", type=int, default=24, help="Terminal rows (default: 24)")
     p.add_argument("--cols", type=int, default=80, help="Terminal columns (default: 80)")
     p.add_argument("--detach", action="store_true",
@@ -288,8 +303,13 @@ def main(argv=None):
 
     # exit
     p = sub.add_parser("exit", help="Terminate a session",
-                        description="Terminate a session. If the server is unresponsive, force-kills the process and cleans up the socket and registry.")
+                        description="Terminate a session. If the server is unresponsive, force-kills the process and cleans up the socket and registry. With --drain, returns any remaining PTY output and the child's exit status before shutting down.")
     p.add_argument("id", help="Session identifier")
+    p.add_argument("--drain", action="store_true",
+                   help="Kill child, flush remaining PTY output, and return "
+                        "it (plus exit_code/signal) before shutdown")
+    p.add_argument("--no_strip_ansi", action="store_true",
+                   help="With --drain, preserve ANSI escape sequences in output")
     p.set_defaults(func=cmd_exit)
 
     args = parser.parse_args(argv)

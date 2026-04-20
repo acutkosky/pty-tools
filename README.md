@@ -35,10 +35,10 @@ All commands are subcommands of `pty`. All responses are JSON. Every response in
 ### pty spawn
 
 ```
-pty spawn <id> <cmd> [--rows 24] [--cols 80] [--detach] [--time_limit SECONDS] [--buffer_limit SIZE]
+pty spawn <id> <cmd...> [--rows 24] [--cols 80] [--detach] [--time_limit SECONDS] [--buffer_limit SIZE]
 ```
 
-Spawn a process in a new PTY session.
+Spawn a process in a new PTY session. `<cmd>` may be either a single shlex-quoted string (`'ls -la'`) or space-separated argv words (`ls -la`).
 
 By default, the server runs in the **foreground**: stdin is forwarded to the PTY line-by-line, and raw PTY output is streamed to stdout. The session is also accessible via socket commands (`pty read`, `pty write`, etc.) from other processes. Status JSON is printed to stderr. The server exits when the child process exits, or on Ctrl+C.
 
@@ -219,7 +219,7 @@ pty list
 ### pty exit
 
 ```
-pty exit <id>
+pty exit <id> [--drain] [--no_strip_ansi]
 ```
 
 Terminate a session. If the server is unresponsive, force-kills the process and cleans up the socket and registry.
@@ -227,6 +227,14 @@ Terminate a session. If the server is unresponsive, force-kills the process and 
 ```bash
 pty exit myshell
 # {"status": "ok", "message": "Shutting down"}
+```
+
+With `--drain`, the server kills the child, flushes any remaining PTY output, and returns it along with the child's exit status before shutting down — useful when you want a last-chance read guaranteed not to miss trailing bytes:
+
+```bash
+pty exit --drain myshell
+# {"status": "ok", "exited": true, "exit_code": 0, "signal": null,
+#  "truncated": 0, "response": "...final output..."}
 ```
 
 ## Architecture
