@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import errno
 import fcntl
 import json
 import os
@@ -21,12 +22,17 @@ import time
 import pyte
 
 from pty_tools.common import (
+    atomic_reserve_session,
     is_server_alive,
-    register_session,
+    read_registry,
     send_request_async,
     socket_path_for,
     unregister_session,
 )
+
+# Exit code the server uses when it loses a duplicate-session race. The
+# daemonizer translates this back to a "session already exists" error.
+EXIT_SESSION_EXISTS = 75
 
 # Regex to strip ANSI escape sequences from raw output
 _ANSI_RE = re.compile(r"\x1b\[[\x20-\x3f]*[0-9;]*[\x20-\x7e]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[>=<]")
@@ -124,19 +130,46 @@ class PTYServer:
     async def start(self):
         self._loop = asyncio.get_running_loop()
 
-        master_fd, slave_fd = _open_pty(self.rows, self.cols)
-        self._proc = await asyncio.create_subprocess_exec(
-            *shlex.split(self.command),
-            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-            start_new_session=True,
-        )
-        os.close(slave_fd)
-        self._master_fd = master_fd
+        # Atomically reserve this session_id. If a live process already owns
+        # it we exit with a dedicated code that the daemonizer decodes into a
+        # "session already exists" error. Done before any resources are
+        # acquired so a loser never leaks a PTY child or socket.
+        if not atomic_reserve_session(
+            self.session_id, self.command, os.getpid(), self.sock_path
+        ):
+            sys.exit(EXIT_SESSION_EXISTS)
 
-        register_session(self.session_id, self.command, os.getpid(), self.sock_path)
-        self._server = await asyncio.start_unix_server(
-            self._handle_client, path=self.sock_path
-        )
+        # Past the reservation: any failure must roll back registry + socket
+        # file so subsequent spawns aren't blocked by our dead entry.
+        try:
+            # Bind next. The reservation cleared any stale socket file under
+            # flock, so this should succeed; if EADDRINUSE still fires, another
+            # non-cooperating process has the path.
+            try:
+                self._server = await asyncio.start_unix_server(
+                    self._handle_client, path=self.sock_path
+                )
+            except OSError as e:
+                unregister_session(self.session_id)
+                if e.errno == errno.EADDRINUSE:
+                    sys.exit(EXIT_SESSION_EXISTS)
+                raise
+
+            # Only now fork the PTY child. If exec fails (bad command), we
+            # fall into the outer except and the rollback unlinks the socket
+            # file and registry entry we just created.
+            master_fd, slave_fd = _open_pty(self.rows, self.cols)
+            self._proc = await asyncio.create_subprocess_exec(
+                *shlex.split(self.command),
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                start_new_session=True,
+            )
+            os.close(slave_fd)
+            self._master_fd = master_fd
+        except BaseException:
+            # SystemExit included — we want its code to propagate, but cleanup first.
+            self._rollback_startup()
+            raise
 
         def _request_shutdown():
             asyncio.create_task(self._shutdown())
@@ -554,6 +587,25 @@ class PTYServer:
         if not self.exited:
             asyncio.create_task(self._shutdown())
 
+    def _rollback_startup(self):
+        """Undo reservation on failed startup so subsequent spawns aren't blocked."""
+        if self._server is not None:
+            try:
+                self._server.close()
+            except Exception:
+                pass
+            self._server = None
+        sock = socket_path_for(self.session_id)
+        if sock.exists():
+            try:
+                sock.unlink()
+            except OSError:
+                pass
+        try:
+            unregister_session(self.session_id)
+        except Exception:
+            pass
+
     async def _shutdown(self):
         if self._shutting_down:
             return
@@ -663,7 +715,28 @@ def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 
                 pass
 
     for _ in range(20):
-        if sock_path.exists():
+        rc = proc.poll()
+        if rc is not None:
+            # Check exit code FIRST: in a race, the winner's socket may already
+            # exist at sock_path, so polling sock_path.exists() would misreport
+            # the loser as successful.
+            if rc == EXIT_SESSION_EXISTS:
+                _read_and_cleanup_err()
+                return {
+                    "status": "error",
+                    "error": f"Session '{session_id}' already exists",
+                }
+            stderr = _read_and_cleanup_err()
+            msg = f"Server for session '{session_id}' did not start"
+            if stderr:
+                msg += f": {stderr}"
+            return {"status": "error", "error": msg}
+
+        # Server still running — consider the spawn successful only when the
+        # registry shows OUR subprocess PID as the owner (proves we won the
+        # race and finished the atomic reservation).
+        entry = read_registry().get(session_id)
+        if entry is not None and entry.get("pid") == proc.pid:
             _read_and_cleanup_err()
             return {
                 "status": "ok",
@@ -672,12 +745,6 @@ def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 
                 "pid": proc.pid,
                 "socket_path": str(sock_path),
             }
-        if proc.poll() is not None:
-            stderr = _read_and_cleanup_err()
-            msg = f"Server for session '{session_id}' did not start"
-            if stderr:
-                msg += f": {stderr}"
-            return {"status": "error", "error": msg}
         time.sleep(0.1)
 
     # Timeout — kill the stalled process

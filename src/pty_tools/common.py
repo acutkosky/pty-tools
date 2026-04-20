@@ -89,6 +89,54 @@ def unregister_session(session_id: str):
     update_registry(_remove)
 
 
+def atomic_reserve_session(session_id: str, command: str, pid: int, socket_path: str) -> bool:
+    """Under a single registry flock, claim the session_id for this process.
+
+    Returns True if the slot was free (or stale) and we've registered ourselves.
+    Returns False if a live process already owns it — caller must bail out.
+
+    This is the only correctness primitive for duplicate-session protection.
+    Callers racing on the same session_id serialize on the registry flock; at
+    most one sees a free slot and wins. Stale registry entries (dead PID) and
+    orphaned socket files from the previous owner are cleaned up here.
+    """
+    outcome = {"reserved": False}
+
+    def _reserve(reg):
+        entry = reg.get(session_id)
+        if entry is not None:
+            other_pid = entry["pid"]
+            alive = True
+            try:
+                os.kill(other_pid, 0)
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                # Can't signal it, but it exists — assume alive (safer default).
+                alive = True
+            if alive:
+                return  # slot is taken; outcome stays False
+            # Dead owner — unlink its socket file, fall through to register.
+            old_sock = Path(entry["socket_path"])
+            if old_sock.exists():
+                old_sock.unlink()
+        # Remove any lingering socket file at our path too (stale from a crash
+        # that left a socket without a registry entry).
+        sp = Path(socket_path)
+        if sp.exists():
+            sp.unlink()
+        reg[session_id] = {
+            "command": command,
+            "pid": pid,
+            "socket_path": socket_path,
+            "created_at": time.time(),
+        }
+        outcome["reserved"] = True
+
+    update_registry(_reserve)
+    return outcome["reserved"]
+
+
 def is_server_alive(session_id: str) -> bool:
     registry = read_registry()
     entry = registry.get(session_id)
