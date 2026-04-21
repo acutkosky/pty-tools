@@ -129,25 +129,45 @@ By default, a read **consumes** the output — subsequent reads only see new dat
 
 ANSI escape sequences are stripped by default. Use `--no-strip-ansi` to preserve them.
 
-Use `--screen` to get a snapshot of the virtual terminal screen instead of the read buffer. This uses [pyte](https://github.com/selectel/pyte) to maintain a virtual terminal that tracks all PTY output. The screen snapshot is independent of the read buffer — it doesn't consume it, and reflects what a user would currently see on the terminal (after cursor movement, clears, scrolling, etc.).
+Use `--screen` to get a snapshot of the virtual terminal screen instead of the read buffer. This uses [pyte](https://github.com/selectel/pyte) to maintain a virtual terminal that tracks all PTY output. The screen snapshot is independent of the read buffer — it doesn't consume it, and reflects what a user would currently see on the terminal (after cursor movement, clears, scrolling, etc.). The response also includes `cursor: [row, col]` (both 0-indexed), which is useful for driving TUIs.
 
 ```bash
 pty read myshell --screen
-# {"status": "ok", "response": "$ echo hello\nhello\n$ ", "rows": 24, "cols": 80}
+# {"status": "ok", "response": "$ echo hello\nhello\n$ ",
+#  "rows": 24, "cols": 80, "cursor": [2, 2], "exited": false, "truncated": 0}
 ```
 
 ### pty interact
 
 ```
-pty interact <id> --input TEXT [--total-timeout 5000] [--stable-timeout 500] [--pattern REGEX] [--no-strip-ansi] [--peek]
+pty interact <id> --input TEXT [--total-timeout 5000] [--stable-timeout 500] [--pattern REGEX] [--no-strip-ansi] [--peek] [--screen] [--diff]
 ```
 
-Atomic write-then-read. Sends `TEXT` and reads the response in a single operation, avoiding race conditions between separate write and read calls. Output format is the same as `pty read`:
+Atomic write-then-read. Sends `TEXT` and reads the response in a single operation, avoiding race conditions between separate write and read calls. Default output format is the same as `pty read`:
 
 ```bash
 pty interact myshell --input 'echo hello\n'
 # {"status": "ok", "exited": false, "response": "echo hello\r\nhello\r\n$ "}
 ```
+
+With `--screen`, the response is a post-write virtual-terminal snapshot instead of the raw buffer (same shape as `pty read --screen`, including `cursor`). The read buffer is not consumed, so a later `pty read` still sees the bytes:
+
+```bash
+pty interact myshell --input 'ls\n' --screen
+# {"status": "ok", "response": "...screen contents...",
+#  "rows": 24, "cols": 80, "cursor": [3, 2], "exited": false, "truncated": 0}
+```
+
+With `--screen --diff`, the server snapshots the screen *before* the write, waits for the output to stabilize, and returns a [unified diff](https://en.wikipedia.org/wiki/Diff#Unified_format) between the pre- and post-write screen. This compresses well for most TUIs (a one-line log append or a cursor move produces a tiny diff regardless of screen size):
+
+```bash
+pty interact myshell --input 'echo hi\n' --screen --diff
+# {"status": "ok", "type": "screen_diff",
+#  "diff": "--- \n+++ \n@@ -1,2 +1,3 @@\n $ echo hi\n+hi\n $ ",
+#  "rows": 24, "cols": 80, "cursor": [3, 2], "exited": false, "truncated": 0}
+```
+
+`--diff` is only meaningful with `--screen`; using it alone is rejected.
 
 ### pty resize
 
@@ -250,7 +270,7 @@ Each session is a server process that:
 3. Listens on a Unix domain socket at `<socket_dir>/session_<id>.sock` (default `/tmp/pty_sessions`, override with `$PTY_SOCKET_DIR` or the `--socket-dir` flag)
 4. Handles JSON messages from clients (write, read, interact, tap, untap, exit)
 
-A pyte virtual terminal (`Screen` + `Stream`) is fed inline in the reader path. This maintains a screen buffer that reflects what a user would see, independent of the read buffer. Screen snapshots are served via the `screen` message type.
+A pyte virtual terminal (`Screen` + `Stream`) is fed inline in the reader path. This maintains a screen buffer that reflects what a user would see, independent of the read buffer. Screen snapshots are served via the `screen` message type and, for `interact --screen`, inline in the interact response. The `--diff` variant snapshots the display while holding the write lock, then diffs the post-output display against it using `difflib.unified_diff` — because the write lock bounds the baseline, no client-side cursor or server-side per-client state is needed.
 
 In foreground mode, the reader thread also streams raw PTY output to stdout, and a separate thread forwards stdin to the PTY. SIGWINCH is caught and propagated to the child. SIGTERM/SIGHUP are forwarded to the child process group before shutdown. In detached mode (`--detach`), stdin/stdout are disconnected and the process runs independently.
 

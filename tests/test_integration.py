@@ -1414,6 +1414,165 @@ class TestScreen:
         assert screen["rows"] == 40
         assert screen["cols"] == 120
 
+    def test_screen_response_includes_cursor(self):
+        """Every screen response should include cursor position as [row, col]."""
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        # Let the prompt render so the cursor is parked somewhere non-trivial.
+        send_request(
+            self.session_id,
+            {"type": "read", "peek": True, "total_timeout": 2000, "stable_timeout": 400},
+            timeout=5.0,
+        )
+
+        screen = send_request(self.session_id, {"type": "screen"}, timeout=5.0)
+        assert "cursor" in screen
+        assert isinstance(screen["cursor"], list)
+        assert len(screen["cursor"]) == 2
+        row, col = screen["cursor"]
+        assert 0 <= row < screen["rows"]
+        assert 0 <= col < screen["cols"]
+
+
+class TestInteractScreen:
+    """Tests for `interact --screen` and `interact --screen --diff`."""
+
+    def setup_method(self):
+        self.session_id = f"test_iscr_{os.getpid()}_{int(time.time() * 1000)}"
+
+    def teardown_method(self):
+        _cleanup_session(self.session_id)
+
+    def test_interact_screen_returns_snapshot(self):
+        """interact with screen=True returns a post-write screen snapshot, not buffer text."""
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo interact_screen_marker\n",
+                "screen": True,
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        # Screen-mode response shape: response is the full display, plus rows/cols/cursor.
+        assert "response" in result
+        assert "interact_screen_marker" in result["response"]
+        assert result["rows"] == 24
+        assert result["cols"] == 80
+        assert "cursor" in result
+        # diff key must NOT be present when --diff wasn't requested
+        assert "diff" not in result
+
+    def test_interact_screen_does_not_consume_read_buffer(self):
+        """interact --screen leaves the raw read buffer intact for later consumers."""
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo buf_marker_xyz\n",
+                "screen": True,
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+
+        # The bytes should still be sitting in the read buffer.
+        read_result = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 400},
+            timeout=10.0,
+        )
+        assert "buf_marker_xyz" in read_result["response"]
+
+    def test_interact_screen_diff_captures_echo(self):
+        """echo-then-output produces a unified diff containing the new line."""
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        # Let the prompt render first so our diff boundary is stable.
+        send_request(
+            self.session_id,
+            {"type": "read", "peek": True, "total_timeout": 2000, "stable_timeout": 400},
+            timeout=5.0,
+        )
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "echo diff_needle_qqq\n",
+                "screen": True,
+                "diff": True,
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert result.get("type") == "screen_diff"
+        assert "diff" in result
+        # Full-screen 'response' should NOT be there when diff was requested.
+        assert "response" not in result
+        # The new output should appear as an added line in the unified diff.
+        assert "diff_needle_qqq" in result["diff"]
+        # Unified diff format: additions begin with '+' (not '+++' header).
+        diff_lines = result["diff"].splitlines()
+        added = [l for l in diff_lines if l.startswith("+") and not l.startswith("+++")]
+        assert any("diff_needle_qqq" in l for l in added)
+        # Common shape checks.
+        assert result["rows"] == 24
+        assert result["cols"] == 80
+        assert "cursor" in result
+
+    def test_interact_screen_diff_empty_when_unchanged(self):
+        """No-op interact (empty input, no output produced) yields an empty diff string."""
+        result = daemonize_server(self.session_id, "cat")
+        assert result["status"] == "ok"
+
+        # cat with no input doesn't produce output — a short-timeout empty-string
+        # interact should see no screen change.
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "",
+                "screen": True,
+                "diff": True,
+                "total_timeout": 600,
+                "stable_timeout": 200,
+            },
+            timeout=5.0,
+        )
+        assert result["status"] == "ok"
+        assert result.get("type") == "screen_diff"
+        assert result["diff"] == ""
+
+    def test_interact_diff_without_screen_rejected_by_cli(self):
+        """`pty interact --diff` without `--screen` must error at the CLI layer."""
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "interact",
+             self.session_id, "--input", "echo x\n", "--diff"],
+            capture_output=True, text=True, timeout=10.0,
+        )
+        assert proc.returncode != 0
+        payload = json.loads(proc.stdout)
+        assert payload["status"] == "error"
+        assert "--diff" in payload["error"] and "--screen" in payload["error"]
+
 
 class TestResize:
     """Tests for PTY resize."""

@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import difflib
 import errno
 import fcntl
 import json
@@ -468,24 +469,36 @@ class PTYServer:
         # Write_lock nested inside prevents concurrent writes from interleaving
         # output with ours. Lock order (read then write) is consistent across
         # every call site that takes both, so no deadlock is possible.
+        screen_mode = msg.get("screen", False)
+        diff_mode = msg.get("diff", False)
         async with self.read_lock:
             async with self.write_lock:
+                # Snapshot the pre-write display before any bytes go out, so
+                # the diff boundary is exactly "what my write caused."
+                pre_display = None
+                if diff_mode:
+                    pre_display = [line.rstrip() for line in self._pyte_screen.display]
                 err = await self._write_under_lock(msg.get("text", ""))
                 if err:
                     return {"status": "error", "error": err}
+                if screen_mode:
+                    await self._wait_for_output(msg)
+                    return self._build_screen_response(pre_display=pre_display)
                 return await self._read_body(msg)
 
     async def _do_read(self, msg: dict) -> dict:
         async with self.read_lock:
             return await self._read_body(msg)
 
-    async def _read_body(self, msg: dict) -> dict:
-        """Read buffer/pattern/timeout loop. Caller must hold self.read_lock."""
+    async def _wait_for_output(self, msg: dict):
+        """Wait for output to appear and stabilize, or timeout.
+
+        Caller must hold self.read_lock. Returns the match_end position if
+        --pattern was provided and matched, else None.
+        """
         total_timeout = msg.get("total_timeout", 5000) / 1000.0
         stable_timeout = msg.get("stable_timeout", 500) / 1000.0
         pattern = msg.get("pattern")
-        strip_ansi = msg.get("strip_ansi", True)
-        peek = msg.get("peek", False)
 
         start = time.monotonic()
         got_output = False
@@ -526,6 +539,14 @@ class PTYServer:
                 prev_appended = self._total_appended
             elif got_output:
                 break
+
+        return match_end
+
+    async def _read_body(self, msg: dict) -> dict:
+        """Read buffer/pattern/timeout loop. Caller must hold self.read_lock."""
+        strip_ansi = msg.get("strip_ansi", True)
+        peek = msg.get("peek", False)
+        match_end = await self._wait_for_output(msg)
 
         result = {"status": "ok", "exited": self.exited,
                   "truncated": self._dropped_bytes}
@@ -637,14 +658,34 @@ class PTYServer:
 
     async def _do_screen(self, msg: dict) -> dict:
         """Return the current virtual terminal screen contents."""
+        return self._build_screen_response()
+
+    def _build_screen_response(self, pre_display: list[str] | None = None) -> dict:
+        """Build a screen-snapshot or screen-diff response.
+
+        If pre_display is provided, returns a unified-diff response against the
+        current display; otherwise returns the full current display.
+        """
         lines = [line.rstrip() for line in self._pyte_screen.display]
-        return {
+        result = {
             "status": "ok",
-            "response": "\n".join(lines),
+            "exited": self.exited,
+            "truncated": self._dropped_bytes,
             "rows": self._pyte_screen.lines,
             "cols": self._pyte_screen.columns,
-            "truncated": self._dropped_bytes,
+            "cursor": [self._pyte_screen.cursor.y, self._pyte_screen.cursor.x],
         }
+        if self.exited:
+            result["exit_code"] = self.exit_code
+            result["signal"] = self.exit_signal
+        if pre_display is not None:
+            result["type"] = "screen_diff"
+            result["diff"] = "\n".join(
+                difflib.unified_diff(pre_display, lines, lineterm="")
+            )
+        else:
+            result["response"] = "\n".join(lines)
+        return result
 
     async def _do_resize(self, msg: dict) -> dict:
         """Resize the PTY and update the virtual terminal."""
