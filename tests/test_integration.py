@@ -31,8 +31,7 @@ def _cleanup_session(session_id: str):
         except (ProcessLookupError, PermissionError):
             pass
     sock = socket_path_for(session_id)
-    if sock.exists():
-        sock.unlink()
+    sock.unlink(missing_ok=True)
     unregister_session(session_id)
 
 
@@ -1557,6 +1556,55 @@ class TestInteractScreen:
         assert result["status"] == "ok"
         assert result.get("type") == "screen_diff"
         assert result["diff"] == ""
+
+    def test_interact_screen_diff_excludes_pre_write_output(self):
+        """Regression: output produced before our interact must NOT appear in the diff.
+
+        Without the pre-snapshot drain, bytes queued in the kernel PTY buffer
+        that _on_readable hadn't yet processed would be fed into pyte only
+        during the post-write await, and the diff would mis-attribute them to
+        the write. With the drain, pyte is up-to-date before the snapshot so
+        those bytes are part of the baseline.
+        """
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        # Let the prompt render and settle so we're starting from a clean state.
+        send_request(
+            self.session_id,
+            {"type": "read", "peek": True, "total_timeout": 2000, "stable_timeout": 400},
+            timeout=5.0,
+        )
+
+        # Produce output via a plain `write` — this returns as soon as the bytes
+        # are accepted by the PTY, which does NOT guarantee _on_readable has
+        # run on the server to feed pyte. The next interact's snapshot is the
+        # race window.
+        send_request(
+            self.session_id,
+            {"type": "write", "text": "echo pre_write_racy_marker\n"},
+            timeout=5.0,
+        )
+
+        # Empty-input interact with --screen --diff. The drain must pull the
+        # queued pre-write output into pyte BEFORE the snapshot so it shows up
+        # in both pre and post displays and cancels out of the diff.
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "",
+                "screen": True,
+                "diff": True,
+                "total_timeout": 2000,
+                "stable_timeout": 400,
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert result.get("type") == "screen_diff"
+        # The pre-write marker must not appear as an addition in the diff.
+        assert "pre_write_racy_marker" not in result["diff"]
 
     def test_interact_diff_without_screen_rejected_by_cli(self):
         """`pty interact --diff` without `--screen` must error at the CLI layer."""

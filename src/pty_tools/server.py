@@ -234,12 +234,17 @@ class PTYServer:
             return
         self._on_data(raw)
 
-    def _drain_pty_final(self):
-        """Synchronously pull any remaining bytes from the PTY master.
+    def _drain_pty_sync(self):
+        """Synchronously pull any bytes already queued on the PTY master fd.
 
-        Used by exit --drain after killing the child: the reader callback
-        may not have run yet for the final burst, so we do the reads
-        directly. The fd is non-blocking, so EAGAIN/EIO both cleanly end.
+        Used whenever we need pyte / the read buffer to reflect "everything
+        the child has produced so far" without waiting for the event loop to
+        schedule the next _on_readable callback. Two call sites today:
+        `exit --drain` (after killing the child, to flush the final burst)
+        and `interact --screen --diff` (immediately before the pre-write
+        snapshot, so queued pre-write output doesn't end up mis-attributed
+        to the write in the diff). The fd is non-blocking, so EAGAIN/EIO
+        both cleanly end the loop.
         """
         fd = self._master_fd
         if fd is None:
@@ -465,18 +470,24 @@ class PTYServer:
     async def _do_interact(self, msg: dict) -> dict:
         if self.exited:
             return {"status": "error", "error": "Session has exited"}
+        screen_mode = msg.get("screen", False)
+        diff_mode = msg.get("diff", False)
+        if diff_mode and not screen_mode:
+            return {"status": "error", "error": "'diff' requires 'screen'"}
         # Acquire read_lock FIRST so no concurrent read can steal our response.
         # Write_lock nested inside prevents concurrent writes from interleaving
         # output with ours. Lock order (read then write) is consistent across
         # every call site that takes both, so no deadlock is possible.
-        screen_mode = msg.get("screen", False)
-        diff_mode = msg.get("diff", False)
         async with self.read_lock:
             async with self.write_lock:
-                # Snapshot the pre-write display before any bytes go out, so
-                # the diff boundary is exactly "what my write caused."
+                # For --diff, snapshot the pre-write display before any bytes
+                # go out. The drain first pulls any kernel-queued bytes into
+                # pyte so the snapshot reflects everything the child produced
+                # before our write — otherwise _on_readable would process
+                # those bytes later and the diff would mis-attribute them.
                 pre_display = None
                 if diff_mode:
+                    self._drain_pty_sync()
                     pre_display = [line.rstrip() for line in self._pyte_screen.display]
                 err = await self._write_under_lock(msg.get("text", ""))
                 if err:
@@ -611,7 +622,7 @@ class PTYServer:
             self.exited = True
 
         # Pull any final bytes that the reader callback hadn't consumed.
-        self._drain_pty_final()
+        self._drain_pty_sync()
 
         async with self.read_lock:
             strip_ansi = msg.get("strip_ansi", True)
