@@ -123,7 +123,7 @@ When the child process exits, includes exit status:
 }
 ```
 
-**Timeout behavior:** Wait up to `--total-timeout` ms for the first byte. Once output starts, return after `--stable-timeout` ms of silence (or when `--total-timeout` expires, whichever comes first). If `--pattern` is given, return as soon as the output matches the regex.
+**Timeout behavior:** Wait up to `--total-timeout` ms for the first byte. Once output starts, return after `--stable-timeout` ms of silence (or when `--total-timeout` expires, whichever comes first). If `--pattern` is given, return as soon as the output matches the regex. In raw read mode, a pattern match is a read boundary: the response includes output through the end of the match, and any bytes after the match remain buffered for the next read. For example, if the buffered output is `abc STOP def` and `--pattern STOP` matches, the response is `abc STOP`; the next read can return ` def`. Zero-width regexes use their zero-width end position, so a lookahead such as `(?=STOP)` returns only the bytes before `STOP`.
 
 By default, a read **consumes** the output — subsequent reads only see new data. Use `--peek` to read without consuming: the output is buffered and included in the next read. A normal read (without `--peek`) clears the buffer. This is useful for monitoring a session without interfering with a primary reader.
 
@@ -150,7 +150,7 @@ pty interact myshell --input 'echo hello\n'
 # {"status": "ok", "exited": false, "response": "echo hello\r\nhello\r\n$ "}
 ```
 
-With `--screen`, the response is a post-write virtual-terminal snapshot instead of the raw buffer (same shape as `pty read --screen`, including `cursor`). The read buffer is not consumed, so a later `pty read` still sees the bytes:
+With `--screen`, the response is a post-write virtual-terminal snapshot instead of the raw buffer (same shape as `pty read --screen`, including `cursor`). The read buffer is not consumed, so a later `pty read` still sees the bytes. If `--pattern` is also used, it only controls how long the command waits; the screen snapshot is not sliced at the regex match.
 
 ```bash
 pty interact myshell --input 'ls\n' --screen

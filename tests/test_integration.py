@@ -137,6 +137,74 @@ class TestFullLifecycle:
         assert result["status"] == "ok"
         assert "MARKER_DONE" in result["response"]
 
+    def test_pattern_match_returns_through_match_and_leaves_tail_buffered(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        # Drain initial output
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "printf 'abc STOP def\\n'\n",
+                "total_timeout": 5000,
+                "stable_timeout": 500,
+                "pattern": "STOP",
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert result["response"] == "abc STOP"
+        assert "def" not in result["response"]
+
+        tail = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+        assert tail["status"] == "ok"
+        assert " def" in tail["response"]
+
+    def test_zero_width_pattern_boundary_leaves_visible_match_buffered(self):
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        # Drain initial output
+        send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "printf 'abc STOP def\\n'\n",
+                "total_timeout": 5000,
+                "stable_timeout": 500,
+                "pattern": "(?=STOP)",
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert result["response"] == "abc "
+        assert "STOP" not in result["response"]
+
+        tail = send_request(
+            self.session_id,
+            {"type": "read", "total_timeout": 2000, "stable_timeout": 300},
+            timeout=5.0,
+        )
+        assert tail["status"] == "ok"
+        assert "STOP def" in tail["response"]
+
     def test_stale_cleanup(self):
         """Registering a session with a dead PID should be cleaned up by is_server_alive."""
         from pty_tools.common import register_session
@@ -1468,6 +1536,26 @@ class TestInteractScreen:
         assert "cursor" in result
         # diff key must NOT be present when --diff wasn't requested
         assert "diff" not in result
+
+    def test_interact_screen_pattern_does_not_slice_snapshot(self):
+        """In screen mode, pattern controls waiting but not response slicing."""
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        result = send_request(
+            self.session_id,
+            {
+                "type": "interact",
+                "text": "printf 'abc STOP def\\n'\n",
+                "screen": True,
+                "total_timeout": 3000,
+                "stable_timeout": 500,
+                "pattern": "STOP",
+            },
+            timeout=10.0,
+        )
+        assert result["status"] == "ok"
+        assert "abc STOP def" in result["response"]
 
     def test_interact_screen_does_not_consume_read_buffer(self):
         """interact --screen leaves the raw read buffer intact for later consumers."""
