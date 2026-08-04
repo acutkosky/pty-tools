@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -324,6 +325,31 @@ class TestFullLifecycle:
         # Neither socket nor registry entry should remain after a failed spawn.
         assert not socket_path_for(self.session_id).exists()
         assert self.session_id not in read_registry()
+
+    def test_detached_spawn_returns_only_after_session_is_ready(self):
+        """Success means the complete request path is immediately usable."""
+        result = daemonize_server(self.session_id, "sh")
+        assert result["status"] == "ok"
+
+        entry = read_registry()[self.session_id]
+        assert entry["pid"] == result["pid"]
+        assert entry["state"] == "ready"
+
+        response = send_request(self.session_id, {"type": "screen"}, timeout=5.0)
+        assert response["status"] == "ok"
+
+        listing = subprocess.run(
+            [sys.executable, "-m", "pty_tools.cli", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        listed = next(
+            item for item in json.loads(listing.stdout)
+            if item["session_id"] == self.session_id
+        )
+        assert "state" not in listed
 
     def test_duplicate_spawn_rejected_by_cli(self):
         """CLI should reject `spawn --detach` against an already-running session."""
@@ -1361,11 +1387,24 @@ class TestTimeLimit:
         )
         assert read_result["exited"] is True
 
+    def test_time_limit_closes_session_if_direct_child_already_exited(self):
+        """The session deadline applies even after an early direct-child exit."""
+        result = daemonize_server(
+            self.session_id, "sh -c 'exit 0'", time_limit=0.5
+        )
+        assert result["status"] == "ok"
+
+        deadline = time.monotonic() + 3.0
+        while is_server_alive(self.session_id) and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        assert not is_server_alive(self.session_id)
+
     def test_time_limit_foreground_mode(self):
         """Foreground mode should also respect time_limit.
 
-        Time-limit expiration SIGKILLs the child, so the server forwards
-        128+SIGKILL (=137) as its exit code.
+        A normal child exits from SIGTERM during the grace period, so the
+        server forwards 128+SIGTERM (=143) as its exit code.
         """
         proc = subprocess.Popen(
             [sys.executable, "-m", "pty_tools.server",
@@ -1376,10 +1415,109 @@ class TestTimeLimit:
         )
 
         proc.wait(timeout=10.0)
-        assert proc.returncode == 128 + signal.SIGKILL, (
-            f"expected 128+SIGKILL={128 + signal.SIGKILL} from time-limit kill, "
+        assert proc.returncode == 128 + signal.SIGTERM, (
+            f"expected 128+SIGTERM={128 + signal.SIGTERM} from time-limit, "
             f"got {proc.returncode}"
         )
+
+    def test_time_limit_allows_direct_child_to_clean_up(self, tmp_path):
+        """SIGTERM handlers get one second to finish before forced killing."""
+        script = tmp_path / "graceful_timeout.py"
+        marker = tmp_path / "cleanup_marker"
+        script.write_text(
+            "import pathlib, signal, sys, time\n"
+            "marker = pathlib.Path(sys.argv[1])\n"
+            "def stop(signum, frame):\n"
+            "    marker.write_text('term received')\n"
+            "    time.sleep(0.25)\n"
+            "    marker.write_text('cleanup complete')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "while True:\n"
+            "    time.sleep(0.05)\n"
+        )
+        command = shlex.join([sys.executable, str(script), str(marker)])
+
+        result = daemonize_server(self.session_id, command, time_limit=0.5)
+        assert result["status"] == "ok"
+
+        deadline = time.monotonic() + 4.0
+        while is_server_alive(self.session_id) and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        assert not is_server_alive(self.session_id)
+        assert marker.read_text() == "cleanup complete"
+
+    def test_time_limit_sigkills_direct_child_after_grace(self):
+        """A direct child that ignores SIGTERM is killed after one second."""
+        command = "sh -c 'trap \"\" TERM; exec sleep 60'"
+        started = time.monotonic()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pty_tools.server",
+             self.session_id, command, "--foreground", "--time-limit", "0.5"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        proc.wait(timeout=10.0)
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 128 + signal.SIGKILL
+        assert elapsed >= 1.25, f"timeout grace was cut short: {elapsed:.3f}s"
+
+    def test_time_limit_does_not_signal_descendant_group(self, tmp_path):
+        """Timeout owns the direct child, not every process in its group."""
+        script = tmp_path / "spawn_descendant.py"
+        pid_file = tmp_path / "descendant_pid"
+        script.write_text(
+            "import os, pathlib, signal, subprocess, sys, time\n"
+            "signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))\n"
+            "code = (\n"
+            "    'import signal, time; '\n"
+            "    'signal.signal(signal.SIGHUP, signal.SIG_IGN); '\n"
+            "    'signal.signal(signal.SIGTERM, signal.SIG_IGN); '\n"
+            "    'time.sleep(60)'\n"
+            ")\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, '-c', code],\n"
+            "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            ")\n"
+            "pathlib.Path(sys.argv[1]).write_text(\n"
+            "    f'{child.pid} {os.getpgrp()} {os.getpgid(child.pid)}'\n"
+            ")\n"
+            "while True:\n"
+            "    time.sleep(0.05)\n"
+        )
+        command = shlex.join([sys.executable, str(script), str(pid_file)])
+        descendant_pid = None
+
+        try:
+            result = daemonize_server(self.session_id, command, time_limit=1.0)
+            assert result["status"] == "ok"
+
+            deadline = time.monotonic() + 2.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert pid_file.exists()
+            descendant_pid, parent_pgid, descendant_pgid = map(
+                int, pid_file.read_text().split()
+            )
+            assert descendant_pgid == parent_pgid
+
+            deadline = time.monotonic() + 4.0
+            while is_server_alive(self.session_id) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert not is_server_alive(self.session_id)
+
+            # Signal 0 succeeds only if timeout left the descendant alone.
+            os.kill(descendant_pid, 0)
+        finally:
+            if descendant_pid is not None:
+                try:
+                    os.kill(descendant_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_time_limit_via_cli(self):
         """CLI --time-limit flag should work with --detach."""

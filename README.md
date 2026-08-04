@@ -58,12 +58,14 @@ pty spawn myshell sh
 echo "ls -la" | pty spawn myshell sh > output.txt 2>/dev/null &
 ```
 
-Use `--time-limit` to set a maximum lifetime in seconds. When the limit expires, the child process is killed and the session is cleaned up. If omitted, the process runs until it exits on its own or is explicitly terminated.
+Use `--time-limit` to set a maximum session lifetime in seconds. At the deadline, the server sends `SIGTERM` to the direct child, gives it one second to clean up, and sends `SIGKILL` to that child if it is still running. The session is then closed. If the direct child has already exited, the session is closed immediately at the deadline. If omitted, no automatic deadline is applied.
 
 ```bash
-# Kill the process after 30 seconds
+# Ask the process to stop after 30 seconds, then force it after a 1s grace
 pty spawn --detach --time-limit 30 myshell 'long-running-command'
 ```
+
+Automatic shutdown deliberately owns only the command that `pty-tools` launched directly. It does not signal that command's entire process group when the command exits, on `pty exit`, or at the time limit. Descendants may still be affected naturally when their terminal closes, but a descendant using standard survival mechanisms such as `nohup`, redirected standard streams, or a new session can outlive the PTY session. If an application needs whole-tree or whole-group containment, launch it through a guardian wrapper that implements that policy. The explicit `pty signal` command remains group-wide.
 
 Use `--buffer-limit` to cap how much child output is retained in memory if no one is reading it. The server keeps a ring buffer of the most recent `SIZE` bytes; older bytes are evicted as new output arrives. Accepts an integer with an optional binary suffix: `4096`, `64K`, `256M`, `1G` (case-insensitive, optional `iB` is tolerated; `K=1024`, `M=1024²`, `G=1024³`). Default is 256M. Every `pty read` / `pty interact` / `pty read --screen` response includes a `"truncated"` field — the cumulative number of output bytes that were dropped from the ring buffer before any reader consumed them. The counter is monotonic for the lifetime of the session, so clients can diff across reads to detect new loss.
 
@@ -71,7 +73,7 @@ Use `--buffer-limit` to cap how much child output is retained in memory if no on
 pty spawn --detach --buffer-limit 64M myshell 'noisy-command'
 ```
 
-With `--detach`, the server runs as a detached background process — the command returns immediately once the session is ready. Detached sessions survive the parent process exiting (including SSH logout).
+With `--detach`, the server runs as a detached background process. The command returns only after the Unix socket is accepting requests, the PTY child has been created, and output and child-exit handling are installed. Detached sessions survive the parent process exiting (including SSH logout).
 
 ```bash
 pty spawn --detach myshell sh
@@ -265,20 +267,20 @@ pty exit --drain myshell
 ## Architecture
 
 Each session is a server process that:
-1. Spawns the child process in a PTY (using stdlib `pty` + `subprocess`)
-2. Runs a background reader thread that continuously reads PTY output into a buffer
-3. Listens on a Unix domain socket at `<socket_dir>/session_<id>.sock` (default `/tmp/pty_sessions`, override with `$PTY_SOCKET_DIR` or the `--socket-dir` flag)
-4. Handles JSON messages from clients (write, read, interact, tap, untap, exit)
+1. Atomically reserves its session ID in the shared registry as `starting`.
+2. Binds, but does not yet serve, a Unix socket at `<socket_dir>/session_<id>.sock` (default `/tmp/pty_sessions`, override with `$PTY_SOCKET_DIR` or the `--socket-dir` flag).
+3. Spawns the child process in a PTY (using stdlib `pty` + `subprocess`) and installs the event-loop PTY reader, child watcher, and optional time limit.
+4. Starts accepting JSON requests and changes its owner-matched registry entry to `ready`.
 
 A pyte virtual terminal (`Screen` + `Stream`) is fed inline in the reader path. This maintains a screen buffer that reflects what a user would see, independent of the read buffer. Screen snapshots are served via the `screen` message type and, for `interact --screen`, inline in the interact response. The `--diff` variant snapshots the display while holding the write lock, then diffs the post-output display against it using `difflib.unified_diff` — because the write lock bounds the baseline, no client-side cursor or server-side per-client state is needed.
 
-In foreground mode, the reader thread also streams raw PTY output to stdout, and a separate thread forwards stdin to the PTY. SIGWINCH is caught and propagated to the child. SIGTERM/SIGHUP are forwarded to the child process group before shutdown. In detached mode (`--detach`), stdin/stdout are disconnected and the process runs independently.
+PTY output is read by the asyncio event loop. In foreground mode, that path also streams raw output to stdout, while a separate thread forwards blocking stdin reads to the PTY. SIGWINCH is caught and propagated to the child. SIGTERM/SIGHUP are forwarded to the child process group before shutdown. In detached mode (`--detach`), stdin/stdout are disconnected and the process runs independently.
 
-Taps are implemented as a set of target session IDs on the server. When new output arrives, each chunk is queued and sent to targets sequentially by a single worker thread, preserving ordering. Failed sends (target exited, socket gone) automatically remove the tap.
+Taps use one asyncio queue and sender task per target. This preserves per-target ordering without allowing a slow target to block other targets. Failed sends (target exited, socket gone) automatically remove the tap.
 
-Reads are serialized (one at a time) via an async lock. The read waits on an event that the background reader signals whenever new data arrives, implementing the timeout and pattern-matching logic reactively.
+Reads are serialized (one at a time) via an async lock. The read waits on an event that the PTY reader signals whenever new data arrives, implementing the timeout and pattern-matching logic reactively.
 
-A shared registry at `<socket_dir>/registry.json` (protected by `flock`) tracks active sessions. The socket directory can be configured via the `PTY_SOCKET_DIR` environment variable or the `--socket-dir <path>` flag (accepted both before and after the subcommand: `pty --socket-dir X spawn ...` and `pty spawn --socket-dir X ...` are equivalent). Both client and server invocations must agree on the value (the `--socket-dir` flag sets the env var so that daemonized servers inherit it).
+A shared registry at `<socket_dir>/registry.json` (protected by `flock`) tracks server ownership and the internal `starting`/`ready` transition. `pty list` exposes only ready sessions and omits the internal state field. Startup rollback and normal shutdown remove a registry entry and socket only if the entry still names that server PID, so stale cleanup cannot remove a replacement server. The socket directory can be configured via the `PTY_SOCKET_DIR` environment variable or the `--socket-dir <path>` flag (accepted both before and after the subcommand: `pty --socket-dir X spawn ...` and `pty spawn --socket-dir X ...` are equivalent). Both client and server invocations must agree on the value (the `--socket-dir` flag sets the env var so that daemonized servers inherit it).
 
 ## Tests
 

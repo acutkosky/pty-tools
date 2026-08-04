@@ -79,6 +79,7 @@ def register_session(session_id: str, command: str, pid: int, socket_path: str):
             "pid": pid,
             "socket_path": socket_path,
             "created_at": time.time(),
+            "state": "ready",
         }
     update_registry(_add)
 
@@ -87,6 +88,57 @@ def unregister_session(session_id: str):
     def _remove(reg):
         reg.pop(session_id, None)
     update_registry(_remove)
+
+
+def mark_session_ready(session_id: str, owner_pid: int) -> bool:
+    """Publish that an owner-matched starting session is ready for clients."""
+    outcome = {"ready": False}
+
+    def _mark(reg):
+        entry = reg.get(session_id)
+        if entry is None or entry.get("pid") != owner_pid:
+            return
+        entry["state"] = "ready"
+        outcome["ready"] = True
+
+    update_registry(_mark)
+    return outcome["ready"]
+
+
+def cleanup_session_if_owner(session_id: str, owner_pid: int) -> bool:
+    """Unlink and remove a session only if owner_pid still owns its entry.
+
+    The socket is unlinked while the registry flock is held and before the
+    entry is removed, so another server cannot claim the ID between those two
+    operations and have its new socket removed by stale cleanup.
+    """
+    outcome = {"removed": False}
+
+    def _cleanup(reg):
+        entry = reg.get(session_id)
+        if entry is None or entry.get("pid") != owner_pid:
+            return
+        sock = Path(entry["socket_path"])
+        if sock.exists():
+            try:
+                sock.unlink()
+            except OSError:
+                pass
+        reg.pop(session_id, None)
+        outcome["removed"] = True
+
+    update_registry(_cleanup)
+    return outcome["removed"]
+
+
+def is_session_ready(session_id: str) -> bool:
+    """Return whether the registry exposes a client-ready session.
+
+    Entries from older pty-tools versions have no state field and are treated
+    as ready for compatibility. New reservations always publish "starting".
+    """
+    entry = read_registry().get(session_id)
+    return entry is not None and entry.get("state", "ready") == "ready"
 
 
 def atomic_reserve_session(session_id: str, command: str, pid: int, socket_path: str) -> bool:
@@ -130,6 +182,7 @@ def atomic_reserve_session(session_id: str, command: str, pid: int, socket_path:
             "pid": pid,
             "socket_path": socket_path,
             "created_at": time.time(),
+            "state": "starting",
         }
         outcome["reserved"] = True
 
@@ -146,10 +199,7 @@ def is_server_alive(session_id: str) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        sock = Path(entry["socket_path"])
-        if sock.exists():
-            sock.unlink()
-        unregister_session(session_id)
+        cleanup_session_if_owner(session_id, pid)
         return False
     except PermissionError:
         return True
@@ -163,6 +213,19 @@ class PTYClientError(Exception):
     pass
 
 
+def _connection_error(session_id: str) -> PTYClientError:
+    if not is_server_alive(session_id):
+        return PTYClientError(
+            f"Session '{session_id}' is not running. It may have exited. "
+            f"Use pty list to see active sessions."
+        )
+    if not is_session_ready(session_id):
+        return PTYClientError(f"Session '{session_id}' is still starting.")
+    return PTYClientError(
+        f"Cannot connect to session '{session_id}' — connection refused."
+    )
+
+
 def send_request(session_id: str, message: dict, timeout: float = 30.0) -> dict:
     """Send a request to a PTY server and receive its response."""
     sock_path = str(socket_path_for(session_id))
@@ -173,14 +236,7 @@ def send_request(session_id: str, message: dict, timeout: float = 30.0) -> dict:
     try:
         sock.connect(sock_path)
     except (ConnectionRefusedError, FileNotFoundError):
-        if not is_server_alive(session_id):
-            raise PTYClientError(
-                f"Session '{session_id}' is not running. It may have exited. "
-                f"Use pty list to see active sessions."
-            )
-        raise PTYClientError(
-            f"Cannot connect to session '{session_id}' — connection refused."
-        )
+        raise _connection_error(session_id)
 
     try:
         sock.sendall(json.dumps(message).encode())
@@ -206,14 +262,7 @@ async def send_request_async(session_id: str, message: dict, timeout: float = 30
             asyncio.open_unix_connection(sock_path), timeout=timeout
         )
     except (ConnectionRefusedError, FileNotFoundError):
-        if not is_server_alive(session_id):
-            raise PTYClientError(
-                f"Session '{session_id}' is not running. It may have exited. "
-                f"Use pty list to see active sessions."
-            )
-        raise PTYClientError(
-            f"Cannot connect to session '{session_id}' — connection refused."
-        )
+        raise _connection_error(session_id)
     try:
         writer.write(json.dumps(message).encode())
         if writer.can_write_eof():

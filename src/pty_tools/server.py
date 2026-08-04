@@ -24,11 +24,12 @@ import pyte
 
 from pty_tools.common import (
     atomic_reserve_session,
+    cleanup_session_if_owner,
     is_server_alive,
+    mark_session_ready,
     read_registry,
     send_request_async,
     socket_path_for,
-    unregister_session,
 )
 
 # Exit code the server uses when it loses a duplicate-session race. The
@@ -39,6 +40,11 @@ EXIT_SESSION_EXISTS = 75
 _ANSI_RE = re.compile(r"\x1b\[[\x20-\x3f]*[0-9;]*[\x20-\x7e]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[>=<]")
 
 DEFAULT_BUFFER_LIMIT = 256 * 1024 * 1024  # 256 MiB
+TIME_LIMIT_GRACE_SECONDS = 1.0
+
+_DETACHED_STARTUP_TIMEOUT_SECONDS = 2.0
+_DETACHED_STARTUP_POLL_SECONDS = 0.01
+_DETACHED_STARTUP_TERMINATE_GRACE_SECONDS = 1.0
 
 _BUFFER_LIMIT_UNITS = {"": 1, "B": 1, "K": 1024, "M": 1024**2, "G": 1024**3}
 
@@ -77,15 +83,20 @@ def parse_buffer_limit(value: str) -> int:
 def _open_pty(rows: int, cols: int):
     """Create a PTY pair and set the terminal size. Returns (master_fd, slave_fd)."""
     master_fd, slave_fd = pty_mod.openpty()
-    settings = termios.tcgetattr(master_fd)
-    settings[3] = settings[3] & ~termios.ECHO
-    termios.tcsetattr(master_fd, termios.TCSADRAIN, settings)
-    # Non-blocking master fd: writes go through asyncio's add_writer when the
-    # slave can't keep up, so a stalled child can't freeze the event loop.
-    fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-    fcntl.fcntl(master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-    winsize = struct.pack("HHHH", rows, cols, 0, 0)
-    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+    try:
+        settings = termios.tcgetattr(master_fd)
+        settings[3] = settings[3] & ~termios.ECHO
+        termios.tcsetattr(master_fd, termios.TCSADRAIN, settings)
+        # Non-blocking master fd: writes go through asyncio's add_writer when the
+        # slave can't keep up, so a stalled child can't freeze the event loop.
+        fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+    except BaseException:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
     return master_fd, slave_fd
 
 
@@ -121,10 +132,14 @@ class PTYServer:
         self._total_appended = 0
         self._server: asyncio.Server | None = None
         self._new_data = asyncio.Event()
+        self._ready = asyncio.Event()
         self._stopped = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutting_down = False
+        self._startup_aborted = False
+        self._startup_complete = False
         self._child_exit_task: asyncio.Task | None = None
+        self._time_limit_handle: asyncio.TimerHandle | None = None
         # One asyncio task per tap target, each fed by its own queue.
         self._tap_senders: dict[str, tuple[asyncio.Queue, asyncio.Task]] = {}
 
@@ -134,6 +149,7 @@ class PTYServer:
 
     async def start(self):
         self._loop = asyncio.get_running_loop()
+        self._install_signal_handlers()
 
         # Atomically reserve this session_id. If a live process already owns
         # it we exit with a dedicated code that the daemonizer decodes into a
@@ -144,70 +160,112 @@ class PTYServer:
         ):
             sys.exit(EXIT_SESSION_EXISTS)
 
-        # Past the reservation: any failure must roll back registry + socket
-        # file so subsequent spawns aren't blocked by our dead entry.
+        # Past the reservation, startup is a transaction: no caller can observe
+        # the session as ready until every resource and callback is installed.
+        # Any failure rolls the owner-matched reservation and resources back.
         try:
+            self._check_startup_aborted()
+
             # Bind next. The reservation cleared any stale socket file under
             # flock, so this should succeed; if EADDRINUSE still fires, another
             # non-cooperating process has the path.
             try:
                 self._server = await asyncio.start_unix_server(
-                    self._handle_client, path=self.sock_path
+                    self._handle_client,
+                    path=self.sock_path,
+                    start_serving=False,
                 )
             except OSError as e:
-                unregister_session(self.session_id)
                 if e.errno == errno.EADDRINUSE:
                     sys.exit(EXIT_SESSION_EXISTS)
                 raise
+            self._check_startup_aborted()
 
             # Only now fork the PTY child. If exec fails (bad command), we
             # fall into the outer except and the rollback unlinks the socket
             # file and registry entry we just created.
             master_fd, slave_fd = _open_pty(self.rows, self.cols)
-            self._proc = await asyncio.create_subprocess_exec(
-                *shlex.split(self.command),
-                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-                start_new_session=True,
-            )
-            os.close(slave_fd)
             self._master_fd = master_fd
+            try:
+                self._proc = await asyncio.create_subprocess_exec(
+                    *shlex.split(self.command),
+                    stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                    start_new_session=True,
+                )
+            finally:
+                os.close(slave_fd)
+            self._check_startup_aborted()
+
+            # Drive PTY reads off the event loop — no background thread needed.
+            self._loop.add_reader(master_fd, self._on_readable)
+
+            # Reap the child when it exits, record status, and wake readers.
+            self._child_exit_task = asyncio.create_task(self._on_child_exit())
+
+            # The socket was bound above but has not accepted requests. Start
+            # serving only after the PTY reader and child watcher are in place.
+            await self._server.start_serving()
+            self._check_startup_aborted()
+
+            # Install even a zero-second limit before readiness, but only after
+            # the last startup yield. It cannot race startup teardown because
+            # callbacks do not run until this coroutine yields again.
+            if self.time_limit is not None:
+                self._time_limit_handle = self._loop.call_later(
+                    self.time_limit, self._on_time_limit
+                )
+
+            # Publish readiness before opening the in-process gate. There is no
+            # await between these operations, so a client that observes ready
+            # can at worst queue in the socket backlog until the gate opens.
+            if not mark_session_ready(self.session_id, os.getpid()):
+                raise RuntimeError("Session reservation was lost during startup")
+            self._startup_complete = True
+            self._ready.set()
+
+            # Foreground stdin is inherently blocking, so it stays in a thread
+            # and dispatches writes into the loop.
+            if self.foreground:
+                threading.Thread(target=self._stdin_loop, daemon=True).start()
+
+            # A very short-lived foreground command can exit while startup is
+            # finishing. Its watcher deliberately defers teardown until now.
+            if self.foreground and self.exited:
+                await self._shutdown()
         except BaseException:
             # SystemExit included — we want its code to propagate, but cleanup first.
-            self._rollback_startup()
+            await self._rollback_startup()
             raise
 
-        def _request_shutdown():
-            asyncio.create_task(self._shutdown())
-
-        # Signal handlers only work on the main thread
+    def _install_signal_handlers(self):
+        """Install signal handlers before startup acquires child resources."""
         try:
             if self.foreground:
-                # Foreground: forward SIGTERM/SIGHUP to child then shutdown
-                for sig in (signal.SIGTERM, signal.SIGHUP):
-                    self._loop.add_signal_handler(sig, self._on_forward_signal, sig)
-                # SIGINT: just shutdown (don't forward — child gets it from the terminal)
-                self._loop.add_signal_handler(signal.SIGINT, _request_shutdown)
+                for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                    self._loop.add_signal_handler(sig, self._on_server_signal, sig)
                 # SIGWINCH: propagate terminal size changes to child
                 self._loop.add_signal_handler(signal.SIGWINCH, self._on_sigwinch)
             else:
                 for sig in (signal.SIGTERM, signal.SIGINT):
-                    self._loop.add_signal_handler(sig, _request_shutdown)
+                    self._loop.add_signal_handler(sig, self._on_server_signal, sig)
         except RuntimeError:
             pass
 
-        if self.time_limit is not None:
-            self._loop.call_later(self.time_limit, self._on_time_limit)
+    def _on_server_signal(self, sig):
+        """Turn signals during startup into a serialized startup abort."""
+        if not self._startup_complete:
+            self._startup_aborted = True
+            return
+        if self.foreground and sig in (signal.SIGTERM, signal.SIGHUP):
+            self._on_forward_signal(sig)
+        else:
+            # Foreground SIGINT is not forwarded: the terminal already sends it
+            # to the foreground process. Detached SIGTERM/SIGINT just shut down.
+            asyncio.create_task(self._shutdown())
 
-        # Drive PTY reads off the event loop — no background thread needed.
-        self._loop.add_reader(master_fd, self._on_readable)
-
-        # Reap the child when it exits, record status, and wake readers.
-        self._child_exit_task = asyncio.create_task(self._on_child_exit())
-
-        # Foreground stdin is inherently blocking, so it stays in a thread
-        # and dispatches writes into the loop.
-        if self.foreground:
-            threading.Thread(target=self._stdin_loop, daemon=True).start()
+    def _check_startup_aborted(self):
+        if self._startup_aborted:
+            raise RuntimeError("Server startup was interrupted")
 
     async def serve(self):
         """Run start() and block until shutdown completes."""
@@ -260,14 +318,17 @@ class PTYServer:
 
     async def _on_child_exit(self):
         """Wait for the child process to exit, then record status and wake readers."""
-        rc = await self._proc.wait()
+        proc = self._proc
+        if proc is None:
+            return
+        rc = await proc.wait()
         if rc >= 0:
             self.exit_code = rc
         else:
             self.exit_signal = -rc
         self.exited = True
         self._new_data.set()
-        if self.foreground:
+        if self.foreground and self._startup_complete:
             await self._shutdown()
 
     def _stdin_loop(self):
@@ -341,6 +402,11 @@ class PTYServer:
         """Handle a single client connection."""
         shutdown_after = False
         try:
+            # A client can guess the bound socket path before the registry says
+            # ready. Never dispatch against a partially initialized server.
+            await self._ready.wait()
+            if self._shutting_down:
+                return
             data = await asyncio.wait_for(reader.read(), timeout=5.0)
             msg = json.loads(data.decode())
             response, shutdown_after = await self._dispatch(msg)
@@ -664,6 +730,8 @@ class PTYServer:
 
     def _on_sigwinch(self):
         """Handle SIGWINCH in foreground mode — propagate terminal size to child."""
+        if not self._startup_complete:
+            return
         size = shutil.get_terminal_size()
         asyncio.create_task(self._do_resize({"rows": size.lines, "cols": size.columns}))
 
@@ -739,33 +807,87 @@ class PTYServer:
         return {"status": "ok", "signal": sig.name}
 
     def _on_time_limit(self):
-        """Called when the time limit expires — kill the child and shut down."""
-        if not self.exited:
-            asyncio.create_task(self._shutdown())
+        """Give the direct child a grace period, then close the session."""
+        if not self._shutting_down:
+            asyncio.create_task(
+                self._shutdown(terminate_grace=TIME_LIMIT_GRACE_SECONDS)
+            )
 
-    def _rollback_startup(self):
-        """Undo reservation on failed startup so subsequent spawns aren't blocked."""
-        if self._server is not None:
+    async def _rollback_startup(self):
+        """Undo an owner-matched startup transaction after any failure."""
+        self._shutting_down = True
+        self._ready.set()
+        self._new_data.set()
+
+        if self._time_limit_handle is not None:
+            self._time_limit_handle.cancel()
+            self._time_limit_handle = None
+
+        if self._proc is not None and self._proc.returncode is None:
             try:
-                self._server.close()
+                # Startup never performs process-group cleanup. The direct
+                # child is the only process pty-tools owns for this purpose.
+                self._proc.kill()
+            except ProcessLookupError:
+                pass
+
+        t = self._child_exit_task
+        if t is not None and t is not asyncio.current_task() and not t.done():
+            try:
+                await t
+            except BaseException:
+                pass
+        elif self._proc is not None and self._proc.returncode is None:
+            try:
+                await self._proc.wait()
+            except BaseException:
+                pass
+
+        self._close_master_fd()
+
+        if self._server is not None:
+            self._server.close()
+            try:
+                await self._server.wait_closed()
             except Exception:
                 pass
             self._server = None
-        sock = socket_path_for(self.session_id)
-        if sock.exists():
-            try:
-                sock.unlink()
-            except OSError:
-                pass
+
         try:
-            unregister_session(self.session_id)
+            cleanup_session_if_owner(self.session_id, os.getpid())
         except Exception:
             pass
+        self._stopped.set()
 
-    async def _shutdown(self):
+    def _close_master_fd(self):
+        """Stop PTY callbacks and close the server's master descriptor."""
+        if self._master_fd is None:
+            return
+        fd = self._master_fd
+        self._master_fd = None
+        if self._loop is not None:
+            try:
+                self._loop.remove_reader(fd)
+            except (ValueError, OSError):
+                pass
+            try:
+                self._loop.remove_writer(fd)
+            except (ValueError, OSError):
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    async def _shutdown(self, *, terminate_grace: float | None = None):
         if self._shutting_down:
             return
         self._shutting_down = True
+        self._ready.set()
+
+        if self._time_limit_handle is not None:
+            self._time_limit_handle.cancel()
+            self._time_limit_handle = None
 
         # Wake any readers blocked on _new_data.wait() so they can observe
         # the _shutting_down flag and return rather than sitting on their
@@ -777,45 +899,64 @@ class PTYServer:
             task.cancel()
         self._tap_senders.clear()
 
+        t = self._child_exit_task
         if self._proc and self._proc.returncode is None:
-            try:
-                self._proc.kill()
-            except ProcessLookupError:
-                pass
+            if terminate_grace is None:
+                try:
+                    self._proc.kill()
+                except ProcessLookupError:
+                    pass
+            else:
+                try:
+                    # asyncio's Process.terminate() addresses only the direct
+                    # child PID. Descendants are deliberately not signaled.
+                    self._proc.terminate()
+                except ProcessLookupError:
+                    pass
+
+                if self._proc.returncode is None:
+                    try:
+                        if t is not None and t is not asyncio.current_task():
+                            await asyncio.wait_for(
+                                asyncio.shield(t), timeout=terminate_grace
+                            )
+                        else:
+                            await asyncio.wait_for(
+                                asyncio.shield(self._proc.wait()),
+                                timeout=terminate_grace,
+                            )
+                    except asyncio.TimeoutError:
+                        if self._proc.returncode is None:
+                            try:
+                                self._proc.kill()
+                            except ProcessLookupError:
+                                pass
 
         # Wait for _on_child_exit to record exit_code/exit_signal before we
         # tear the loop down — otherwise run_server can't propagate them.
         # (_on_child_exit itself calls _shutdown in foreground mode; skip the
         # await when we're already running inside it to avoid self-deadlock.
         # Skip too if the task has been cleared/cancelled by _do_exit_drain.)
-        t = self._child_exit_task
         if t is not None and t is not asyncio.current_task() and not t.done():
             try:
                 await t
             except BaseException:
                 pass
 
-        if self._master_fd is not None:
-            fd = self._master_fd
-            self._master_fd = None
-            try:
-                self._loop.remove_reader(fd)
-            except (ValueError, OSError):
-                pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        self._close_master_fd()
 
-        if self._server:
+        if self._server is not None:
             self._server.close()
+            try:
+                await self._server.wait_closed()
+            except Exception:
+                pass
+            self._server = None
 
-        sock = socket_path_for(self.session_id)
-        if sock.exists():
-            sock.unlink()
-
-        unregister_session(self.session_id)
-        self._stopped.set()
+        try:
+            cleanup_session_if_owner(self.session_id, os.getpid())
+        finally:
+            self._stopped.set()
 
 
 def run_server(session_id: str, command: str, rows: int = 24, cols: int = 80,
@@ -876,18 +1017,21 @@ def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 
             except Exception:
                 pass
 
-    for _ in range(20):
+    deadline = time.monotonic() + _DETACHED_STARTUP_TIMEOUT_SECONDS
+    while True:
         rc = proc.poll()
         if rc is not None:
             # Check exit code FIRST: in a race, the winner's socket may already
             # exist at sock_path, so polling sock_path.exists() would misreport
             # the loser as successful.
             if rc == EXIT_SESSION_EXISTS:
+                cleanup_session_if_owner(session_id, proc.pid)
                 _read_and_cleanup_err()
                 return {
                     "status": "error",
                     "error": f"Session '{session_id}' already exists",
                 }
+            cleanup_session_if_owner(session_id, proc.pid)
             stderr = _read_and_cleanup_err()
             msg = f"Server for session '{session_id}' did not start"
             if stderr:
@@ -895,10 +1039,14 @@ def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 
             return {"status": "error", "error": msg}
 
         # Server still running — consider the spawn successful only when the
-        # registry shows OUR subprocess PID as the owner (proves we won the
-        # race and finished the atomic reservation).
+        # registry shows OUR subprocess PID as a ready owner. A "starting"
+        # reservation excludes duplicate names but is not usable yet.
         entry = read_registry().get(session_id)
-        if entry is not None and entry.get("pid") == proc.pid:
+        if (
+            entry is not None
+            and entry.get("pid") == proc.pid
+            and entry.get("state") == "ready"
+        ):
             _read_and_cleanup_err()
             return {
                 "status": "ok",
@@ -907,13 +1055,30 @@ def daemonize_server(session_id: str, command: str, rows: int = 24, cols: int = 
                 "pid": proc.pid,
                 "socket_path": str(sock_path),
             }
-        time.sleep(0.1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_DETACHED_STARTUP_POLL_SECONDS, remaining))
 
-    # Timeout — kill the stalled process
+    # Timeout: first request catchable rollback. Only use SIGKILL if the server
+    # cannot finish cleanup within the bounded grace period.
     try:
-        proc.kill()
-    except Exception:
+        proc.terminate()
+    except ProcessLookupError:
         pass
+    try:
+        proc.wait(timeout=_DETACHED_STARTUP_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=_DETACHED_STARTUP_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+
+    cleanup_session_if_owner(session_id, proc.pid)
     stderr = _read_and_cleanup_err()
     msg = f"Server for session '{session_id}' did not start"
     if stderr:

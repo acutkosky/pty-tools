@@ -9,11 +9,11 @@ import sys
 
 from pty_tools.common import (
     PTYClientError,
+    cleanup_session_if_owner,
     is_server_alive,
     read_registry,
     send_request,
     socket_path_for,
-    unregister_session,
 )
 from pty_tools.server import DEFAULT_BUFFER_LIMIT, daemonize_server, parse_buffer_limit, run_server
 
@@ -180,8 +180,14 @@ def cmd_list(args):
     registry = read_registry()
     active = []
     for session_id, entry in list(registry.items()):
-        if is_server_alive(session_id):
-            active.append({"session_id": session_id, **entry})
+        if not is_server_alive(session_id):
+            continue
+        # A live "starting" entry reserves its name but is not client-ready.
+        # Legacy entries have no state and remain visible for compatibility.
+        if entry.get("state", "ready") != "ready":
+            continue
+        public_entry = {k: v for k, v in entry.items() if k != "state"}
+        active.append({"session_id": session_id, **public_entry})
     print(json.dumps(active, indent=2))
 
 
@@ -206,12 +212,11 @@ def _force_cleanup(session_id: str):
             os.kill(entry["pid"], signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-
-    sock = socket_path_for(session_id)
-    if sock.exists():
-        sock.unlink()
-
-    unregister_session(session_id)
+        cleanup_session_if_owner(session_id, entry["pid"])
+    else:
+        # With no registry owner there is no live session identity to protect;
+        # remove a possible orphan left by an uncatchable crash.
+        socket_path_for(session_id).unlink(missing_ok=True)
     print(json.dumps({"status": "ok", "message": f"Force-cleaned session '{session_id}'"}))
 
 
@@ -253,7 +258,8 @@ def main(argv=None):
     p.add_argument("--detach", action="store_true",
                    help="Daemonize the server (default: run in foreground)")
     p.add_argument("--time-limit", type=float, default=None,
-                   help="Maximum lifetime in seconds; process is killed when exceeded")
+                   help="Maximum lifetime in seconds; direct child gets SIGTERM, "
+                        "then SIGKILL after a 1-second grace period")
     p.add_argument("--buffer-limit", type=parse_buffer_limit, default=DEFAULT_BUFFER_LIMIT,
                    help="Max bytes retained from child output in a ring buffer "
                         "(suffixes K/M/G, binary; e.g. 64M, 1G). Default: 256M. "
