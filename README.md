@@ -4,7 +4,23 @@ Command-line tools for spawning processes in PTYs and interacting with them prog
 
 ## Install
 
+Install the command-line tool from PyPI with `uv`:
+
+```bash
+uv tool install pty-tools
 ```
+
+Alternatively, install it with `pip`:
+
+```bash
+python -m pip install pty-tools
+```
+
+To set up a development checkout instead:
+
+```bash
+git clone https://github.com/acutkosky/pty-tools.git
+cd pty-tools
 uv sync
 ```
 
